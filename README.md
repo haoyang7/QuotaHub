@@ -19,7 +19,7 @@ cp docker-compose.yml.example docker-compose.yml
 docker compose up -d --build --force-recreate
 ```
 
-浏览器打开 http://localhost:8788（端口由 `QUOTAHUB_LISTEN_PORT` 或 `config.json` 的 `listen_port` 决定）
+浏览器打开 http://localhost:28787 （端口由 `QUOTAHUB_LISTEN_PORT` 或 `config.json` 的 `listen_port` 决定）
 
 更新镜像：
 

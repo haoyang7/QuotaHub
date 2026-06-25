@@ -5,6 +5,8 @@
 
 ## 致谢
 
+感谢 [LinuxDo](https://linux.do) 社区佬友们的交流与分享；
+
 OpenCode Go 额度查询功能的实现参考了 [opencode-cc](https://github.com/Kiowx/opencode-cc)（[@Kiowx](https://github.com/Kiowx)），感谢佬友的开源分享。
 
 

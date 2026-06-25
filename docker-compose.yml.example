@@ -1,0 +1,19 @@
+name: quotahub
+
+services:
+  quotahub:
+    build: .
+    image: quotahub:latest
+    container_name: quotahub
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      QUOTAHUB_CONFIG: /data/config.json
+      QUOTAHUB_LISTEN_HOST: "0.0.0.0"
+      QUOTAHUB_LISTEN_PORT: "8788"
+      # 出站 HTTPS 需要代理时填写，例如 http://127.0.0.1:7890
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1}
+    volumes:
+      - ./config.json:/data/config.json:ro

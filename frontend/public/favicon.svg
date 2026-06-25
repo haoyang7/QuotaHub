@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="8 8 84 84" width="100%" height="100%">
+    <defs>
+        <linearGradient id="quota2PodGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#67E8F9"/>
+            <stop offset="45%" stop-color="#06B6D4"/>
+            <stop offset="100%" stop-color="#0EA5E9"/>
+        </linearGradient>
+        <linearGradient id="quota2BaseGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#FB923C"/>
+            <stop offset="100%" stop-color="#EA580C"/>
+        </linearGradient>
+        <linearGradient id="quota2CoreGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#FDE047"/>
+            <stop offset="100%" stop-color="#D97706"/>
+        </linearGradient>
+        <linearGradient id="quota2GlowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#A5F3FC"/>
+            <stop offset="100%" stop-color="#FDE68A"/>
+        </linearGradient>
+    </defs>
+    <path d="M 26 24 L 74 24 L 74 44 A 8 8 0 0 0 74 60 L 74 81 L 26 81 L 26 60 A 8 8 0 0 0 26 44 L 26 24 Z" fill="url(#quota2PodGrad)" fill-opacity="0.1"/>
+    <path d="M 26 24 L 74 24 L 74 44 A 8 8 0 0 0 74 60 L 74 81 L 26 81 L 26 60 A 8 8 0 0 0 26 44 L 26 24 Z" fill="none" stroke="url(#quota2PodGrad)" stroke-width="8" stroke-linejoin="round"/>
+    <rect x="20" y="81" width="60" height="8" rx="4" fill="url(#quota2BaseGrad)"/>
+    <line x1="42" y1="85" x2="58" y2="85" stroke="#7C2D12" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="50" cy="52" r="18" fill="url(#quota2GlowGrad)" opacity="0.22"/>
+    <circle cx="50" cy="52" r="13" fill="none" stroke="url(#quota2CoreGrad)" stroke-width="3" opacity="0.25"/>
+    <path d="M 50 39 A 13 13 0 1 1 39 59" fill="none" stroke="url(#quota2CoreGrad)" stroke-width="3" stroke-linecap="round"/>
+    <path d="M 43 59 L 39 59 L 39 63" fill="none" stroke="url(#quota2CoreGrad)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="50" cy="52" r="5" fill="url(#quota2CoreGrad)"/>
+    <circle cx="49" cy="50" r="1.5" fill="#FFFFFF"/>
+</svg>

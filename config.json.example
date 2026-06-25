@@ -1,0 +1,32 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 28787,
+  "refresh": {
+    "ollama": {
+      "auto_refresh": true,
+      "interval_sec": 300
+    },
+    "opencode_go": {
+      "auto_refresh": true,
+      "interval_sec": 300
+    }
+  },
+  "ollama_accounts": [
+    {
+      "name": "OllamaAccount1",
+      "session_cookie": "aid=YOUR_AID; __Secure-session=YOUR_SESSION_VALUE",
+      "show_session": true,
+      "show_weekly": true
+    }
+  ],
+  "opencode_accounts": [
+    {
+      "name": "OpenCodeAccount1",
+      "workspace_id": "Default",
+      "auth_cookie": "auth=YOUR_COOKIE_VALUE",
+      "show_rolling": true,
+      "show_weekly": true,
+      "show_monthly": true
+    }
+  ]
+}

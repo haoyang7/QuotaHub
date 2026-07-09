@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+DEFAULT_USAGE_SERVER_ID = (
+    "bfd684bfc2e4eed05cd0b518f5e4eafd3f3376e3938abb9e536e7c03df831e5c"
+)
+
 
 @dataclass
 class AccountConfig:
@@ -32,6 +36,29 @@ class RefreshSettings:
 
 
 @dataclass
+class OpenCodeSettings:
+    usage_server_id: str = DEFAULT_USAGE_SERVER_ID
+
+
+@dataclass
+class UsageSyncSettings:
+    auto_sync: bool = True
+    interval_sec: int = 300
+    backfill_pages_per_request: int = 5
+    max_pages_per_incremental: int = 10
+
+
+@dataclass
+class ServiceConfig:
+    listen_host: str
+    listen_port: int
+    refresh_ollama: RefreshSettings
+    refresh_opencode_go: RefreshSettings
+    opencode: OpenCodeSettings
+    usage_sync: UsageSyncSettings
+
+
+@dataclass
 class AppConfig:
     listen_host: str
     listen_port: int
@@ -39,6 +66,8 @@ class AppConfig:
     ollama_accounts: list[OllamaAccountConfig]
     refresh_ollama: RefreshSettings
     refresh_opencode_go: RefreshSettings
+    opencode: OpenCodeSettings
+    usage_sync: UsageSyncSettings
 
 
 def _parse_refresh_settings(raw: dict[str, Any] | None, *, default_interval: int) -> RefreshSettings:
@@ -56,6 +85,46 @@ def _parse_refresh_settings(raw: dict[str, Any] | None, *, default_interval: int
     )
 
 
+def _parse_usage_sync_settings(raw: dict[str, Any] | None) -> UsageSyncSettings:
+    if not isinstance(raw, dict):
+        return UsageSyncSettings()
+    interval = raw.get("interval_sec", 300)
+    backfill = raw.get("backfill_pages_per_request", 5)
+    max_pages = raw.get("max_pages_per_incremental", 10)
+    try:
+        interval_sec = max(15, int(interval))
+    except (TypeError, ValueError):
+        interval_sec = 300
+    try:
+        backfill_pages = max(1, min(int(backfill), 50))
+    except (TypeError, ValueError):
+        backfill_pages = 5
+    try:
+        max_pages_per_incremental = max(1, min(int(max_pages), 100))
+    except (TypeError, ValueError):
+        max_pages_per_incremental = 10
+    return UsageSyncSettings(
+        auto_sync=bool(raw.get("auto_sync", True)),
+        interval_sec=interval_sec,
+        backfill_pages_per_request=backfill_pages,
+        max_pages_per_incremental=max_pages_per_incremental,
+    )
+
+
+def _parse_opencode_settings(raw: dict[str, Any] | None) -> OpenCodeSettings:
+    if not isinstance(raw, dict):
+        return OpenCodeSettings()
+    server_id = str(raw.get("usage_server_id") or DEFAULT_USAGE_SERVER_ID).strip()
+    return OpenCodeSettings(usage_server_id=server_id or DEFAULT_USAGE_SERVER_ID)
+
+
+def data_dir() -> Path:
+    env_path = os.environ.get("QUOTAHUB_CONFIG")
+    if env_path:
+        return Path(env_path).resolve().parent
+    return Path(__file__).resolve().parents[2] / "data"
+
+
 def _project_root() -> Path:
     env_path = os.environ.get("QUOTAHUB_CONFIG")
     if env_path:
@@ -70,14 +139,21 @@ def config_path() -> Path:
     return _project_root() / "config.json"
 
 
-def load_config() -> AppConfig:
+def _read_config_raw() -> dict[str, Any]:
     path = config_path()
     if not path.exists():
         raise FileNotFoundError(f"配置文件不存在: {path}，请复制 config.json.example 为 config.json")
+    return json.loads(path.read_text(encoding="utf-8"))
 
-    raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-    opencode_accounts_raw = raw.get("opencode_accounts") or []
-    ollama_accounts_raw = raw.get("ollama_accounts") or []
+
+def _parse_accounts_from_raw(raw: dict[str, Any]) -> tuple[list[AccountConfig], list[OllamaAccountConfig]]:
+    import_block = raw.get("import_accounts")
+    if isinstance(import_block, dict):
+        opencode_accounts_raw = import_block.get("opencode_accounts") or []
+        ollama_accounts_raw = import_block.get("ollama_accounts") or []
+    else:
+        opencode_accounts_raw = raw.get("opencode_accounts") or []
+        ollama_accounts_raw = raw.get("ollama_accounts") or []
 
     opencode_accounts: list[AccountConfig] = []
     for i, item in enumerate(opencode_accounts_raw):
@@ -106,21 +182,120 @@ def load_config() -> AppConfig:
                 show_weekly=bool(item.get("show_weekly", True)),
             )
         )
+    return opencode_accounts, ollama_accounts
 
-    if not opencode_accounts and not ollama_accounts:
-        raise ValueError("config.json 中 opencode_accounts 与 ollama_accounts 不能同时为空")
 
+def runtime_config_path() -> Path:
+    return data_dir() / "service.json"
+
+
+def _read_runtime_config() -> dict[str, Any]:
+    path = runtime_config_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_service_config() -> ServiceConfig:
+    raw = _deep_merge(_read_config_raw(), _read_runtime_config())
     refresh_raw = raw.get("refresh") if isinstance(raw.get("refresh"), dict) else {}
-    refresh_ollama = _parse_refresh_settings(refresh_raw.get("ollama"), default_interval=300)
-    refresh_opencode_go = _parse_refresh_settings(refresh_raw.get("opencode_go"), default_interval=60)
-
-    return AppConfig(
+    return ServiceConfig(
         listen_host=str(os.environ.get("QUOTAHUB_LISTEN_HOST") or raw.get("listen_host") or "127.0.0.1"),
         listen_port=int(os.environ.get("QUOTAHUB_LISTEN_PORT") or raw.get("listen_port") or 8788),
+        refresh_ollama=_parse_refresh_settings(refresh_raw.get("ollama"), default_interval=300),
+        refresh_opencode_go=_parse_refresh_settings(refresh_raw.get("opencode_go"), default_interval=60),
+        opencode=_parse_opencode_settings(raw.get("opencode")),
+        usage_sync=_parse_usage_sync_settings(raw.get("usage_sync")),
+    )
+
+
+def update_service_config(updates: dict[str, Any]) -> ServiceConfig:
+    runtime = _read_runtime_config()
+    refresh_updates = updates.get("refresh")
+    if isinstance(refresh_updates, dict):
+        refresh_raw = runtime.setdefault("refresh", {})
+        for key, value in refresh_updates.items():
+            if not isinstance(value, dict):
+                continue
+            section = refresh_raw.setdefault(key, {})
+            if value.get("auto_refresh") is not None:
+                section["auto_refresh"] = bool(value["auto_refresh"])
+            if value.get("interval_sec") is not None:
+                section["interval_sec"] = int(value["interval_sec"])
+
+    usage_sync_updates = updates.get("usage_sync")
+    if isinstance(usage_sync_updates, dict):
+        section = runtime.setdefault("usage_sync", {})
+        for field in ("auto_sync", "interval_sec", "backfill_pages_per_request", "max_pages_per_incremental"):
+            if usage_sync_updates.get(field) is not None:
+                section[field] = usage_sync_updates[field]
+
+    opencode_updates = updates.get("opencode")
+    if isinstance(opencode_updates, dict):
+        section = runtime.setdefault("opencode", {})
+        if opencode_updates.get("usage_server_id") is not None:
+            section["usage_server_id"] = str(opencode_updates["usage_server_id"]).strip()
+
+    path = runtime_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(runtime, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return load_service_config()
+
+
+def load_config() -> AppConfig:
+    from . import db
+    from .bootstrap import ensure_accounts_imported
+
+    ensure_accounts_imported()
+    service = load_service_config()
+    opencode_rows = db.list_opencode_accounts()
+    ollama_rows = db.list_ollama_accounts()
+
+    opencode_accounts = [
+        AccountConfig(
+            name=row.name,
+            workspace_id=row.workspace_id,
+            auth_cookie=row.auth_cookie,
+            show_rolling=row.show_rolling,
+            show_weekly=row.show_weekly,
+            show_monthly=row.show_monthly,
+        )
+        for row in opencode_rows
+        if row.enabled
+    ]
+    ollama_accounts = [
+        OllamaAccountConfig(
+            name=row.name,
+            session_cookie=row.session_cookie,
+            show_session=row.show_session,
+            show_weekly=row.show_weekly,
+        )
+        for row in ollama_rows
+        if row.enabled
+    ]
+
+    return AppConfig(
+        listen_host=service.listen_host,
+        listen_port=service.listen_port,
         opencode_accounts=opencode_accounts,
         ollama_accounts=ollama_accounts,
-        refresh_ollama=refresh_ollama,
-        refresh_opencode_go=refresh_opencode_go,
+        refresh_ollama=service.refresh_ollama,
+        refresh_opencode_go=service.refresh_opencode_go,
+        opencode=service.opencode,
+        usage_sync=service.usage_sync,
     )
 
 

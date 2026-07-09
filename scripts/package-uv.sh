@@ -24,5 +24,6 @@ echo "$version" > "$staging/$pkg_name/VERSION"
 chmod +x "$staging/$pkg_name/scripts/start.sh"
 
 mkdir -p "$output_dir"
-( cd "$staging" && zip -rq "$output_dir/${pkg_name}-uv.zip" "$pkg_name" )
-echo "已生成: $output_dir/${pkg_name}-uv.zip"
+output_abs="$(cd "$output_dir" && pwd)/${pkg_name}-uv.zip"
+( cd "$staging" && zip -rq "$output_abs" "$pkg_name" )
+echo "已生成: $output_abs"

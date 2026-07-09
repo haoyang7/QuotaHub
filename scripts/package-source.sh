@@ -41,5 +41,6 @@ cp "$root/README.md" "$root/Dockerfile" "$root/config.json.example" "$root/docke
 echo "$version" > "$staging/$pkg_name/VERSION"
 
 mkdir -p "$output_dir"
-( cd "$staging" && zip -rq "$output_dir/${pkg_name}-source.zip" "$pkg_name" )
-echo "已生成: $output_dir/${pkg_name}-source.zip"
+output_abs="$(cd "$output_dir" && pwd)/${pkg_name}-source.zip"
+( cd "$staging" && zip -rq "$output_abs" "$pkg_name" )
+echo "已生成: $output_abs"

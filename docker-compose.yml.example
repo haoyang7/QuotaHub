@@ -15,5 +15,6 @@ services:
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1}
-    volumes:
-      - ./config.json:/data/config.json:ro
+    # 从初版更新时，解除注释本条以导入配置，导入后可注释并移除原有config  
+    # volumes:
+    #   - ./config.json:/data/config.json:ro

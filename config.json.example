@@ -8,25 +8,36 @@
     },
     "opencode_go": {
       "auto_refresh": true,
-      "interval_sec": 300
+      "interval_sec": 60
     }
   },
-  "ollama_accounts": [
-    {
-      "name": "OllamaAccount1",
-      "session_cookie": "aid=YOUR_AID; __Secure-session=YOUR_SESSION_VALUE",
-      "show_session": true,
-      "show_weekly": true
-    }
-  ],
-  "opencode_accounts": [
-    {
-      "name": "OpenCodeAccount1",
-      "workspace_id": "Default",
-      "auth_cookie": "auth=YOUR_COOKIE_VALUE",
-      "show_rolling": true,
-      "show_weekly": true,
-      "show_monthly": true
-    }
-  ]
+  "opencode": {
+    "usage_server_id": "bfd684bfc2e4eed05cd0b518f5e4eafd3f3376e3938abb9e536e7c03df831e5c"
+  },
+  "usage_sync": {
+    "auto_sync": true,
+    "interval_sec": 300,
+    "backfill_pages_per_request": 5,
+    "max_pages_per_incremental": 10
+  },
+  "import_accounts": {
+    "opencode_accounts": [
+      {
+        "name": "OpenCodeAccount1",
+        "workspace_id": "Default",
+        "auth_cookie": "auth=YOUR_COOKIE_VALUE",
+        "show_rolling": true,
+        "show_weekly": true,
+        "show_monthly": true
+      }
+    ],
+    "ollama_accounts": [
+      {
+        "name": "OllamaAccount1",
+        "session_cookie": "aid=YOUR_AID; __Secure-session=YOUR_SESSION_VALUE",
+        "show_session": true,
+        "show_weekly": true
+      }
+    ]
+  }
 }

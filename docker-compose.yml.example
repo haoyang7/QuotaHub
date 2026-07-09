@@ -8,13 +8,18 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      QUOTAHUB_CONFIG: /data/config.json
+      QUOTAHUB_DATA: /data
       QUOTAHUB_LISTEN_HOST: "0.0.0.0"
-      QUOTAHUB_LISTEN_PORT: "8788"
+      QUOTAHUB_LISTEN_PORT: "28787"
       # 出站 HTTPS 需要代理时填写，例如 http://127.0.0.1:7890
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1}
-    # 从初版更新时，解除注释本条以导入配置，导入后可注释并移除原有config  
+    volumes:
+      - ./data:/data
+    # 从 v0.1 / 初版 v0.2 升级时，可临时挂载 config.json 以导入账号与设置：
+    # environment:
+    #   QUOTAHUB_CONFIG: /data/config.json
     # volumes:
+    #   - ./data:/data
     #   - ./config.json:/data/config.json:ro

@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from . import db
-from .bootstrap import ensure_accounts_imported
+from .bootstrap import ensure_bootstrapped
 from .analytics import build_overview
 from .config import load_config, load_service_config, mask_cookie, mask_ollama_cookie, update_service_config
 from .ollama_quota import fetch_all_ollama_quotas
@@ -64,7 +64,7 @@ async def _usage_auto_sync_loop() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global _sync_task
-    ensure_accounts_imported()
+    ensure_bootstrapped()
     service = load_service_config()
     if service.usage_sync.auto_sync:
         _sync_task = asyncio.create_task(_usage_auto_sync_loop())
@@ -432,7 +432,7 @@ async def list_all_usage(
 @app.get("/api/config")
 async def config_status() -> dict:
     try:
-        ensure_accounts_imported()
+        ensure_bootstrapped()
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return _build_config_response()
@@ -441,7 +441,7 @@ async def config_status() -> dict:
 @app.put("/api/config")
 async def update_config(body: ServiceConfigUpdate) -> dict:
     try:
-        ensure_accounts_imported()
+        ensure_bootstrapped()
         updates: dict[str, Any] = {}
         if body.refresh is not None:
             updates["refresh"] = {

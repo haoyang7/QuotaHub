@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -100,6 +101,12 @@ def init_db() -> None:
                 total_records INTEGER NOT NULL DEFAULT 0,
                 oldest_record_at TEXT,
                 newest_record_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS service_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             """
         )
@@ -694,6 +701,38 @@ def refresh_usage_sync_totals(account_id: str) -> None:
             WHERE account_id = ?
             """,
             (row["total"], row["oldest"], row["newest"], account_id),
+        )
+
+
+def has_service_settings() -> bool:
+    with get_conn() as conn:
+        row = conn.execute("SELECT 1 FROM service_settings WHERE id = 1").fetchone()
+    return row is not None
+
+
+def get_service_settings_payload() -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT payload FROM service_settings WHERE id = 1").fetchone()
+    if row is None:
+        return {}
+    try:
+        data = json.loads(row["payload"])
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_service_settings_payload(payload: dict[str, Any]) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO service_settings (id, payload, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                payload = excluded.payload,
+                updated_at = excluded.updated_at
+            """,
+            (json.dumps(payload, ensure_ascii=False), _now_iso()),
         )
 
 

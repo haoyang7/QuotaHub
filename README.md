@@ -13,26 +13,44 @@ OpenCode Go 额度查询功能的实现参考了 [opencode-cc](https://github.co
 ## Docker 部署
 
 ```bash
-cp config.json.example config.json
 cp docker-compose.yml.example docker-compose.yml
 docker compose up -d --build --force-recreate
 ```
 
 浏览器打开 http://localhost:28787 （端口由 `QUOTAHUB_LISTEN_PORT` 决定）
 
-SQLite 数据库在 `/data/quotahub.db`，初版升级用户可将`config.json` 挂载到 `/data/config.json`以进行数据迁移。
+数据目录默认为 `./data`，内含 SQLite 数据库 `quotahub.db` 与服务设置。
+
+
+### 从 v0.1 升级
+
+首次升级可**临时**挂载旧 `config.json`，自动导入账号与设置后写入数据库：
+
+```yaml
+environment:
+  QUOTAHUB_CONFIG: /data/config.json
+volumes:
+  - ./data:/data
+  - ./config.json:/data/config.json:ro
+```
+
+若曾在设置页保存过配置，同目录下的 `service.json` 也会一并迁移（`service.json` 优先级更高）。
+
+导入完成后可去掉 `config.json` 挂载；账号与设置在 SQLite 中维护，不再依赖配置文件。
+
 
 ## 配置说明
 
-| 字段 | 说明 |
-|------|------|
-| `listen_host` / `listen_port` | 监听地址 |
-| `refresh.*` | 额度自动刷新间隔 |
-| `usage_sync.*` | 使用记录自动增量同步 |
-| `opencode.usage_server_id` | OpenCode getUsageInfo 端点 ID（一般无需修改） |
-| `import_accounts` | **仅首次启动**导入到 SQLite，之后请在页面管理账号 |
+运行时**不再依赖** `config.json`，配置在「设置」页面修改，后续变更将保存到 SQLite。
 
-初版更新后会自动导入配置信息，完成后写入 `/data/.imported`，不再读取 config 中的账号字段，可安全删除config文件。
+| 来源 | 说明 |
+|------|------|
+| 环境变量 `QUOTAHUB_LISTEN_HOST` / `QUOTAHUB_LISTEN_PORT` | 监听地址（优先） |
+| 环境变量 `QUOTAHUB_DATA` | 数据目录，默认 `/data` |
+| SQLite `service_settings` | 刷新间隔、同步参数等 |
+| `config.json`（可选，仅迁移用） | 首次导入账号与旧版设置 |
+
+`import_accounts` 块或顶层账号字段仅在首次导入时读取，完成后写入 `/data/.imported`。
 
 
 ## API 概览
@@ -47,8 +65,9 @@ SQLite 数据库在 `/data/quotahub.db`，初版升级用户可将`config.json` 
 | POST | `/api/accounts/opencode/{id}/usage/sync` | 增量同步 |
 | POST | `/api/accounts/opencode/{id}/usage/backfill` | 补拉历史 |
 | GET/POST | `/api/accounts/ollama` | Ollama 账号 CRUD |
+| GET/PUT | `/api/config` | 读取 / 更新服务设置 |
 
-完整 UI：仪表盘、账号管理、账户详情（额度 + 使用记录）、设置。
+完整 UI：数据概览、账号额度、调用日志、账号管理、设置。
 
 
 ## 技术栈

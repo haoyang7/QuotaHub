@@ -1,4 +1,5 @@
 {
+  "_comment": "v0.2 后请勿使用本配置文件，仅作为 v0.1 升级配置导入格式示例",
   "listen_host": "127.0.0.1",
   "listen_port": 28787,
   "refresh": {

@@ -1,7 +1,7 @@
 import pytest
 
 from app import db
-from app.bootstrap import ensure_accounts_imported
+from app.bootstrap import ensure_bootstrapped
 
 
 def test_create_and_list_opencode_account(temp_data_dir):
@@ -113,6 +113,7 @@ def test_list_all_usage_records_and_daily_stats(temp_data_dir):
 
 def test_import_from_config_once(temp_data_dir, monkeypatch: pytest.MonkeyPatch):
     config = temp_data_dir / "config.json"
+    monkeypatch.setenv("QUOTAHUB_CONFIG", str(config))
     config.write_text(
         """
         {
@@ -129,7 +130,7 @@ def test_import_from_config_once(temp_data_dir, monkeypatch: pytest.MonkeyPatch)
         """,
         encoding="utf-8",
     )
-    ensure_accounts_imported()
+    ensure_bootstrapped()
     assert db.count_opencode_accounts() == 1
     assert db.imported_flag_path().exists()
 
@@ -137,5 +138,5 @@ def test_import_from_config_once(temp_data_dir, monkeypatch: pytest.MonkeyPatch)
         '{"listen_host":"127.0.0.1","listen_port":8788,"opencode_accounts":[]}',
         encoding="utf-8",
     )
-    ensure_accounts_imported()
+    ensure_bootstrapped()
     assert db.count_opencode_accounts() == 1

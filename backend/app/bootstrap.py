@@ -1,18 +1,36 @@
 from __future__ import annotations
 
 from . import db
-from .config import _parse_accounts_from_raw, _read_config_raw
+from .config import (
+    _deep_merge,
+    _parse_accounts_from_raw,
+    extract_settings_payload,
+    merge_settings_with_defaults,
+    read_optional_config_raw,
+    read_optional_runtime_config,
+    save_settings_payload,
+)
+
+
+def ensure_settings_migrated() -> None:
+    if db.has_service_settings():
+        return
+    legacy = _deep_merge(read_optional_config_raw(), read_optional_runtime_config())
+    payload = extract_settings_payload(legacy)
+    save_settings_payload(payload)
 
 
 def ensure_accounts_imported() -> None:
-    db.init_db()
     if db.imported_flag_path().exists():
         return
     if db.count_opencode_accounts() > 0 or db.count_ollama_accounts() > 0:
         db.imported_flag_path().write_text("imported\n", encoding="utf-8")
         return
 
-    raw = _read_config_raw()
+    raw = read_optional_config_raw()
+    if not raw:
+        return
+
     opencode_accounts, ollama_accounts = _parse_accounts_from_raw(raw)
 
     for account in opencode_accounts:
@@ -39,3 +57,9 @@ def ensure_accounts_imported() -> None:
 
     if opencode_accounts or ollama_accounts:
         db.imported_flag_path().write_text("imported\n", encoding="utf-8")
+
+
+def ensure_bootstrapped() -> None:
+    db.init_db()
+    ensure_settings_migrated()
+    ensure_accounts_imported()

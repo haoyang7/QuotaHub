@@ -42,7 +42,7 @@ function sumOllamaCycle(accounts: OllamaQuotaAccount[], label: string): CycleQuo
     const window = account.windows?.find((w) => w.label === label);
     if (!window) continue;
 
-    const multiplier = label === "Session" ? planMultiplier(account.plan || "") : 1;
+    const multiplier = planMultiplier(account.plan || "");
     const capacity = 100 * multiplier;
     total += capacity;
 

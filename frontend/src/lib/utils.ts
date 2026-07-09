@@ -57,6 +57,15 @@ export function ollamaModelColor(index: number): string {
   return OLLAMA_MODEL_COLORS[index % OLLAMA_MODEL_COLORS.length];
 }
 
+export function buildModelColorMap(models: string[]): Map<string, string> {
+  const sorted = [...new Set(models)].sort();
+  const map = new Map<string, string>();
+  sorted.forEach((model, index) => {
+    map.set(model, ollamaModelColor(index));
+  });
+  return map;
+}
+
 export function usageTone(used: number): string {
   if (used >= 90) return "text-rose-600";
   if (used >= 70) return "text-amber-600";
@@ -67,4 +76,44 @@ export function progressTone(used: number): string {
   if (used >= 90) return "bg-rose-500";
   if (used >= 70) return "bg-amber-500";
   return "bg-gradient-to-r from-cyan-500 to-sky-500";
+}
+
+const LABEL_MONTHLY = "Monthly";
+const LABEL_WEEKLY = "Weekly";
+const LABEL_ROLLING = "5h Rolling";
+
+export function applyOpenCodeCascade(windows: import("@/lib/api").QuotaWindow[]): import("@/lib/api").QuotaWindow[] {
+  const monthly = windows.find((w) => w.label === LABEL_MONTHLY);
+  const weekly = windows.find((w) => w.label === LABEL_WEEKLY);
+  const monthlyFull = monthly != null && monthly.used >= 100;
+  const weeklyFull = weekly != null && weekly.used >= 100;
+
+  return windows.map((window) => {
+    let blocked = false;
+    let blockedBy = "";
+    if (window.label === LABEL_WEEKLY && monthlyFull) {
+      blocked = true;
+      blockedBy = LABEL_MONTHLY;
+    } else if (window.label === LABEL_ROLLING && (monthlyFull || weeklyFull)) {
+      blocked = true;
+      blockedBy = monthlyFull ? LABEL_MONTHLY : LABEL_WEEKLY;
+    }
+    return {
+      ...window,
+      blocked,
+      blocked_by: blockedBy,
+      effective_remaining: blocked ? 0 : window.remaining,
+    };
+  });
+}
+
+export function opencodeBlockedLabel(blockedBy: string | undefined): string {
+  switch (blockedBy) {
+    case LABEL_MONTHLY:
+      return "月限额已满";
+    case LABEL_WEEKLY:
+      return "周限额已满";
+    default:
+      return "限额已满";
+  }
 }

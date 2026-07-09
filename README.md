@@ -10,7 +10,29 @@
 OpenCode Go 额度查询功能的实现参考了 [opencode-cc](https://github.com/Kiowx/opencode-cc)（[@Kiowx](https://github.com/Kiowx)）。
 
 
+## 获取与部署
+
+| 方式 | 适合谁 | 说明 |
+|------|--------|------|
+| [GitHub Release](https://github.com/lvmiao233/QuotaHub/releases) | 大多数用户 | 提供 Docker 镜像、UV 运行时包、源码包，Release 页有详细说明 |
+| Docker | 已有 Docker 的环境 | 见下文 |
+| UV 运行时包 | 已安装 [uv](https://docs.astral.sh/uv/) | 解压后 `scripts/start.sh`（Linux/macOS）或 `scripts\start.bat`（Windows） |
+| 源码包 / Git 克隆 | 需要改代码或自行构建 | 需 uv；改前端时另需 pnpm |
+
+
 ## Docker 部署
+
+**使用 Release 镜像（推荐）：**
+
+```bash
+docker pull ghcr.io/lvmiao233/quotahub:latest
+docker run -d --name quotahub \
+  -p 28787:8788 \
+  -v ./data:/data \
+  ghcr.io/lvmiao233/quotahub:latest
+```
+
+**本地构建：**
 
 ```bash
 cp docker-compose.yml.example docker-compose.yml
@@ -20,6 +42,60 @@ docker compose up -d --build --force-recreate
 浏览器打开 http://localhost:28787 （端口由 `QUOTAHUB_LISTEN_PORT` 决定）
 
 数据目录默认为 `./data`，内含 SQLite 数据库 `quotahub.db` 与服务设置。
+
+
+## 直接运行（无需 Docker）
+
+### 从 Release 下载 UV 包
+
+要求：Python >= 3.11，已安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)。
+
+```bash
+unzip quotahub-v0.2.0-uv.zip
+cd quotahub-v0.2.0
+./scripts/start.sh
+```
+
+Windows（PowerShell）：
+
+```powershell
+Expand-Archive quotahub-v0.2.0-uv.zip
+cd quotahub-v0.2.0
+scripts\start.bat
+```
+
+默认监听 http://127.0.0.1:8788 ，数据目录为 `./data`。
+
+常用环境变量：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `QUOTAHUB_DATA` | `./data` | SQLite 与数据文件目录 |
+| `QUOTAHUB_LISTEN_HOST` | `127.0.0.1` | 监听地址 |
+| `QUOTAHUB_LISTEN_PORT` | `8788` | 监听端口 |
+
+
+### 从源码运行
+
+```bash
+git clone https://github.com/lvmiao233/QuotaHub.git
+cd QuotaHub
+
+# 构建前端
+cd frontend && corepack enable && pnpm install --frozen-lockfile && pnpm build && cd ..
+
+# 启动（Linux / macOS）
+./scripts/start.sh
+```
+
+Windows：
+
+```bat
+git clone https://github.com/lvmiao233/QuotaHub.git
+cd QuotaHub
+cd frontend && corepack enable && pnpm install --frozen-lockfile && pnpm build && cd ..
+scripts\start.bat
+```
 
 
 ### 从 v0.1 升级
@@ -72,6 +148,6 @@ volumes:
 
 ## 技术栈
 
-- 后端：Python 3.13、FastAPI、httpx、SQLite、uv
+- 后端：Python 3.11+、FastAPI、httpx、SQLite、uv
 - 前端：Vite、React、react-router-dom、Tailwind CSS
-- 部署：Docker multi-stage
+- 部署：Docker / uv 直接运行

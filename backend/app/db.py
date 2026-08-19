@@ -1296,7 +1296,11 @@ def update_cpa_channel(channel_id: str, **fields: Any) -> CPAChannelRow | None:
         updates: list[str] = []
         values: list[Any] = []
         for key, value in changed.items():
-            if key in {"management_key", "cpamp_management_key"}:
+            if key == "management_key":
+                # The native CPA column is NOT NULL; an empty value means the
+                # optional endpoint was removed and is stored as an empty string.
+                value = encrypt_secret(str(value)) if value else ""
+            elif key == "cpamp_management_key":
                 value = encrypt_secret(str(value)) if value else None
             elif key == "enabled":
                 value = int(bool(value))

@@ -84,6 +84,48 @@ def test_cpa_channel_crud_encrypts_key_and_never_returns_it(temp_data_dir):
     assert db.get_cpa_channel(channel_id) is None
 
 
+def test_cpa_endpoint_removal_after_source_switch_clears_non_nullable_key(
+    temp_data_dir,
+):
+    client = _admin_client()
+    created = client.post(
+        "/api/admin/cpa/channels",
+        json={
+            "name": "Migrated CPA",
+            "cpa_endpoint": {
+                "url": "https://proxy.example.com/",
+                "management_key": "legacy-native-key",
+            },
+            "cpamp_endpoint": {
+                "url": "https://cpamp.example.com/",
+                "admin_key": "snapshot-key",
+            },
+        },
+    )
+    assert created.status_code == 200
+    channel_id = created.json()["id"]
+
+    switched = client.post(
+        f"/api/admin/cpa/channels/{channel_id}/quota-source",
+        json={"source": "cpamp_snapshot"},
+    )
+    assert switched.status_code == 200
+
+    removed = client.put(
+        f"/api/admin/cpa/channels/{channel_id}",
+        json={"cpa_endpoint": None},
+    )
+    assert removed.status_code == 200
+    assert removed.json()["cpa_url"] is None
+    assert db.get_cpa_channel(channel_id).management_key == ""
+
+    with db.get_conn() as conn:
+        stored = conn.execute(
+            "SELECT management_key FROM cpa_channels WHERE id = ?", (channel_id,)
+        ).fetchone()
+    assert stored["management_key"] == ""
+
+
 def test_cpa_disabled_channel_hidden_publicly_and_delete_cascades_snapshots(temp_data_dir):
     channel = db.create_cpa_channel(
         name="CPA",

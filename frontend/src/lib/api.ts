@@ -109,11 +109,13 @@ export interface CPAQuotaAccount {
   stale: boolean;
   updated_at: string;
   last_attempt_at?: string | null;
-  quota_source?: "response_header" | "active_api";
+  quota_source?: "usage_queue" | "quota_snapshots" | "header_snapshots" | "response_header" | "active_api";
   observed_at?: string;
   windows: QuotaWindow[];
   error?: string;
 }
+
+export type CPAQuotaSource = "none" | "native_queue" | "cpamp_snapshot";
 
 export interface PublicCPAChannel {
   public_id: string;
@@ -122,17 +124,37 @@ export interface PublicCPAChannel {
   stale: boolean;
   last_attempt_at?: string | null;
   last_success_at?: string | null;
+  quota_source: CPAQuotaSource;
+  source_status: string;
+  snapshot_source?: "quota_snapshots" | "header_snapshots" | null;
+  last_source_snapshot_at?: string | null;
   error?: string;
   accounts: CPAQuotaAccount[];
 }
 
 export interface AdminCPAChannel extends PublicCPAChannel {
   id: string;
-  url: string;
+  cpa_url?: string | null;
+  cpamp_url?: string | null;
   enabled: boolean;
   interval_sec: number;
+  queue_status:
+    | "awaiting_confirmation"
+    | "active"
+    | "empty"
+    | "config_disabled"
+    | "auth_error"
+    | "unsupported"
+    | "degraded"
+    | "disabled";
+  queue_enabled: boolean;
+  exclusive_confirmed_at?: string | null;
+  queue_last_poll_at?: string | null;
+  queue_last_event_at?: string | null;
+  queue_last_error_code?: string | null;
   created_at: string;
   updated_at: string;
+  sync_scheduled?: boolean;
 }
 
 export interface PublicQuotaResponse {
@@ -399,4 +421,13 @@ export const api = {
     }),
   deleteCPAChannel: (id: string) =>
     request<{ ok: boolean }>(`/api/admin/cpa/channels/${id}`, { method: "DELETE" }),
+  updateCPAQuotaSource: (
+    id: string,
+    body: { source: CPAQuotaSource; confirm_exclusive?: boolean }
+  ) =>
+    request<AdminCPAChannel>(`/api/admin/cpa/channels/${id}/quota-source`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
 };

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .config import data_dir
-from .secrets import decrypt_secret, encrypt_secret, is_encrypted
+from .secrets import decrypt_secret, encrypt_secret, is_encrypted, keyed_fingerprint
 
 
 class CollectionGuardRejected(RuntimeError):
@@ -21,6 +21,25 @@ class CollectionGuardRejected(RuntimeError):
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _compare_observations(incoming: str | None, existing: str | None) -> int:
+    if not incoming or not existing:
+        return 1
+    try:
+        incoming_at = datetime.fromisoformat(incoming.replace("Z", "+00:00"))
+        existing_at = datetime.fromisoformat(existing.replace("Z", "+00:00"))
+    except ValueError:
+        return (incoming > existing) - (incoming < existing)
+    if incoming_at.tzinfo is None:
+        incoming_at = incoming_at.replace(tzinfo=UTC)
+    if existing_at.tzinfo is None:
+        existing_at = existing_at.replace(tzinfo=UTC)
+    normalized_incoming = incoming_at.astimezone(UTC)
+    normalized_existing = existing_at.astimezone(UTC)
+    return (normalized_incoming > normalized_existing) - (
+        normalized_incoming < normalized_existing
+    )
 
 
 def db_path() -> Path:
@@ -175,6 +194,12 @@ def init_db() -> None:
                 name TEXT NOT NULL,
                 base_url TEXT NOT NULL,
                 management_key TEXT NOT NULL,
+                cpamp_base_url TEXT,
+                cpamp_management_key TEXT,
+                quota_source TEXT NOT NULL DEFAULT 'none',
+                source_revision INTEGER NOT NULL DEFAULT 1,
+                cpa_endpoint_revision INTEGER NOT NULL DEFAULT 1,
+                cpamp_endpoint_revision INTEGER NOT NULL DEFAULT 1,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 collection_revision INTEGER NOT NULL DEFAULT 1,
                 interval_sec INTEGER NOT NULL DEFAULT 1800,
@@ -183,6 +208,14 @@ def init_db() -> None:
                 last_attempt_status TEXT,
                 stale INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
+                queue_status TEXT NOT NULL DEFAULT 'awaiting_confirmation',
+                queue_enabled INTEGER NOT NULL DEFAULT 0,
+                exclusive_confirmed_at TEXT,
+                queue_last_poll_at TEXT,
+                queue_last_event_at TEXT,
+                queue_last_error_code TEXT,
+                snapshot_source TEXT,
+                last_source_snapshot_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -190,6 +223,11 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS cpa_quota_snapshots (
                 channel_id TEXT NOT NULL REFERENCES cpa_channels(id) ON DELETE CASCADE,
                 account_key_hash TEXT NOT NULL,
+                canonical_account_hash TEXT,
+                source_mode TEXT NOT NULL DEFAULT 'native_queue',
+                endpoint_revision INTEGER NOT NULL DEFAULT 1,
+                locator_hash TEXT,
+                subject_hash TEXT,
                 public_id TEXT NOT NULL UNIQUE,
                 account_display TEXT NOT NULL,
                 plan TEXT NOT NULL,
@@ -202,6 +240,7 @@ def init_db() -> None:
                 error TEXT,
                 quota_source TEXT,
                 observed_at TEXT,
+                accept_observed_after TEXT,
                 last_active_attempt_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -210,6 +249,23 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_cpa_snapshot_channel_visible
                 ON cpa_quota_snapshots(channel_id, visible, created_at);
+
+            CREATE TABLE IF NOT EXISTS cpa_accounts (
+                channel_id TEXT NOT NULL REFERENCES cpa_channels(id) ON DELETE CASCADE,
+                canonical_account_hash TEXT NOT NULL,
+                public_id TEXT NOT NULL UNIQUE,
+                account_display TEXT NOT NULL,
+                plan TEXT NOT NULL DEFAULT '未知套餐',
+                locator_hash TEXT,
+                subject_hash TEXT,
+                visible INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (channel_id, canonical_account_hash)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cpa_accounts_channel_visible
+                ON cpa_accounts(channel_id, visible, created_at);
 
             CREATE TABLE IF NOT EXISTS service_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -246,6 +302,7 @@ def init_db() -> None:
             );
             """
         )
+        conn.execute("BEGIN IMMEDIATE")
         cpa_snapshot_columns = {
             row["name"]
             for row in conn.execute(
@@ -253,15 +310,134 @@ def init_db() -> None:
             ).fetchall()
         }
         for column_name, column_type in (
+            ("canonical_account_hash", "TEXT"),
+            ("source_mode", "TEXT NOT NULL DEFAULT 'native_queue'"),
+            ("endpoint_revision", "INTEGER NOT NULL DEFAULT 1"),
+            ("locator_hash", "TEXT"),
+            ("subject_hash", "TEXT"),
             ("quota_source", "TEXT"),
             ("observed_at", "TEXT"),
+            ("accept_observed_after", "TEXT"),
             ("last_active_attempt_at", "TEXT"),
         ):
             if column_name not in cpa_snapshot_columns:
                 conn.execute(
                     f"ALTER TABLE cpa_quota_snapshots ADD COLUMN {column_name} {column_type}"
                 )
-        for table in ("opencode_accounts", "ollama_accounts", "cpa_channels"):
+        cpa_channel_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(cpa_channels)").fetchall()
+        }
+        for column_name, column_type in (
+            ("cpamp_base_url", "TEXT"),
+            ("cpamp_management_key", "TEXT"),
+            ("quota_source", "TEXT NOT NULL DEFAULT 'none'"),
+            ("source_revision", "INTEGER NOT NULL DEFAULT 1"),
+            ("cpa_endpoint_revision", "INTEGER NOT NULL DEFAULT 1"),
+            ("cpamp_endpoint_revision", "INTEGER NOT NULL DEFAULT 1"),
+            ("queue_status", "TEXT NOT NULL DEFAULT 'awaiting_confirmation'"),
+            ("queue_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("exclusive_confirmed_at", "TEXT"),
+            ("queue_last_poll_at", "TEXT"),
+            ("queue_last_event_at", "TEXT"),
+            ("queue_last_error_code", "TEXT"),
+            ("snapshot_source", "TEXT"),
+            ("last_source_snapshot_at", "TEXT"),
+        ):
+            if column_name not in cpa_channel_columns:
+                conn.execute(
+                    f"ALTER TABLE cpa_channels ADD COLUMN {column_name} {column_type}"
+                )
+        conn.execute(
+            """
+            UPDATE cpa_channels
+            SET quota_source = 'none', queue_enabled = 0,
+                exclusive_confirmed_at = NULL,
+                queue_status = CASE WHEN enabled = 1
+                    THEN 'awaiting_confirmation' ELSE 'disabled' END
+            WHERE quota_source IS NULL OR quota_source = 'none' OR quota_source NOT IN
+                ('none', 'native_queue', 'cpamp_snapshot')
+            """
+        )
+        conn.execute(
+            """
+            UPDATE cpa_quota_snapshots
+            SET canonical_account_hash = COALESCE(canonical_account_hash, account_key_hash),
+                source_mode = CASE
+                    WHEN quota_source IN ('quota_snapshots', 'header_snapshots')
+                        THEN 'cpamp_snapshot'
+                    WHEN quota_source = 'usage_queue' THEN 'native_queue'
+                    ELSE 'legacy'
+                END
+            WHERE canonical_account_hash IS NULL
+            """
+        )
+        generation_rows = conn.execute(
+            """
+            SELECT rowid, channel_id, account_key_hash, canonical_account_hash,
+                source_mode, endpoint_revision, observed_at
+            FROM cpa_quota_snapshots
+            WHERE canonical_account_hash IS NOT NULL AND endpoint_revision > 1
+            """
+        ).fetchall()
+        for generation_row in generation_rows:
+            expected_hash = _snapshot_storage_hash(
+                generation_row["source_mode"],
+                generation_row["canonical_account_hash"],
+                int(generation_row["endpoint_revision"]),
+            )
+            if generation_row["account_key_hash"] == expected_hash:
+                continue
+            conflict = conn.execute(
+                """
+                SELECT rowid, observed_at FROM cpa_quota_snapshots
+                WHERE channel_id = ? AND account_key_hash = ?
+                """,
+                (generation_row["channel_id"], expected_hash),
+            ).fetchone()
+            if conflict is not None:
+                if (
+                    _compare_observations(
+                        generation_row["observed_at"], conflict["observed_at"]
+                    )
+                    >= 0
+                ):
+                    conn.execute(
+                        "DELETE FROM cpa_quota_snapshots WHERE rowid = ?",
+                        (conflict["rowid"],),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM cpa_quota_snapshots WHERE rowid = ?",
+                        (generation_row["rowid"],),
+                    )
+                    continue
+            conn.execute(
+                """
+                UPDATE cpa_quota_snapshots SET account_key_hash = ?
+                WHERE rowid = ?
+                """,
+                (expected_hash, generation_row["rowid"]),
+            )
+        now = _now_iso()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO cpa_accounts (
+                channel_id, canonical_account_hash, public_id, account_display,
+                plan, locator_hash, subject_hash, visible, created_at, updated_at
+            )
+            SELECT channel_id, canonical_account_hash, public_id, account_display,
+                plan, locator_hash, subject_hash, visible, created_at, ?
+            FROM cpa_quota_snapshots
+            WHERE canonical_account_hash IS NOT NULL
+            """,
+            (now,),
+        )
+        for table in (
+            "opencode_accounts",
+            "ollama_accounts",
+            "cpa_channels",
+        ):
             columns = {
                 row["name"]
                 for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -271,6 +447,151 @@ def init_db() -> None:
                     f"ALTER TABLE {table} ADD COLUMN collection_revision "
                     "INTEGER NOT NULL DEFAULT 1"
                 )
+        legacy_cpamp_channel = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cpamp_channels'"
+        ).fetchone()
+        legacy_cpamp_snapshot = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cpamp_quota_snapshots'"
+        ).fetchone()
+        if legacy_cpamp_channel is not None:
+            cpamp_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(cpamp_channels)").fetchall()
+            }
+            if "collection_revision" not in cpamp_columns:
+                conn.execute(
+                    "ALTER TABLE cpamp_channels ADD COLUMN collection_revision "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
+            channel_id_map: dict[str, str] = {}
+            for legacy in conn.execute("SELECT * FROM cpamp_channels").fetchall():
+                target_id = str(legacy["id"])
+                if conn.execute(
+                    "SELECT 1 FROM cpa_channels WHERE id = ?", (target_id,)
+                ).fetchone():
+                    target_id = str(uuid.uuid4())
+                channel_id_map[str(legacy["id"])] = target_id
+                conn.execute(
+                    """
+                    INSERT INTO cpa_channels (
+                        id, public_id, name, base_url, management_key,
+                        cpamp_base_url, cpamp_management_key, quota_source,
+                        enabled, collection_revision, interval_sec,
+                        last_attempt_at, last_success_at, last_attempt_status,
+                        stale, error, snapshot_source, last_source_snapshot_at,
+                        queue_status, created_at, updated_at
+                    ) VALUES (?, ?, ?, '', '', ?, ?, 'cpamp_snapshot', ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, 'disabled', ?, ?)
+                    """,
+                    (
+                        target_id,
+                        str(legacy["public_id"]),
+                        str(legacy["name"]),
+                        str(legacy["base_url"]),
+                        str(legacy["management_key"]),
+                        int(legacy["enabled"]),
+                        max(1, int(legacy["collection_revision"])),
+                        max(300, int(legacy["interval_sec"])),
+                        legacy["last_attempt_at"],
+                        legacy["last_success_at"],
+                        legacy["last_attempt_status"],
+                        int(legacy["stale"]),
+                        legacy["error"],
+                        legacy["snapshot_source"],
+                        legacy["last_source_snapshot_at"],
+                        legacy["created_at"],
+                        legacy["updated_at"],
+                    ),
+                )
+            if legacy_cpamp_snapshot is not None:
+                legacy_snapshot_columns = {
+                    row["name"]
+                    for row in conn.execute(
+                        "PRAGMA table_info(cpamp_quota_snapshots)"
+                    ).fetchall()
+                }
+                for legacy in conn.execute(
+                    "SELECT * FROM cpamp_quota_snapshots"
+                ).fetchall():
+                    target_id = channel_id_map.get(str(legacy["channel_id"]))
+                    if target_id is None:
+                        continue
+                    canonical_hash = str(legacy["account_key_hash"])
+                    storage_hash = _snapshot_storage_hash(
+                        "cpamp_snapshot", canonical_hash
+                    )
+                    locator_hash = (
+                        legacy["locator_hash"]
+                        if "locator_hash" in legacy_snapshot_columns
+                        else None
+                    )
+                    subject_hash = (
+                        legacy["subject_hash"]
+                        if "subject_hash" in legacy_snapshot_columns
+                        else None
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO cpa_accounts (
+                            channel_id, canonical_account_hash, public_id,
+                            account_display, plan, locator_hash, subject_hash,
+                            visible, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            target_id,
+                            canonical_hash,
+                            legacy["public_id"],
+                            legacy["account_display"],
+                            legacy["plan"],
+                            locator_hash,
+                            subject_hash,
+                            int(legacy["visible"]),
+                            legacy["created_at"],
+                            legacy["updated_at"],
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO cpa_quota_snapshots (
+                            channel_id, account_key_hash, canonical_account_hash,
+                            source_mode, endpoint_revision, locator_hash, subject_hash,
+                            public_id, account_display, plan, windows_json, visible,
+                            last_attempt_at, last_success_at, last_attempt_status,
+                            stale, error, quota_source, observed_at,
+                            accept_observed_after, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'cpamp_snapshot', 1, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            target_id,
+                            storage_hash,
+                            canonical_hash,
+                            locator_hash,
+                            subject_hash,
+                            str(uuid.uuid4()),
+                            legacy["account_display"],
+                            legacy["plan"],
+                            legacy["windows_json"],
+                            int(legacy["visible"]),
+                            legacy["last_attempt_at"],
+                            legacy["last_success_at"],
+                            legacy["last_attempt_status"],
+                            int(legacy["stale"]),
+                            legacy["error"],
+                            legacy["quota_source"],
+                            legacy["observed_at"],
+                            (
+                                legacy["accept_observed_after"]
+                                if "accept_observed_after" in legacy_snapshot_columns
+                                else None
+                            ),
+                            legacy["created_at"],
+                            legacy["updated_at"],
+                        ),
+                    )
+            conn.execute("DROP TABLE IF EXISTS cpamp_quota_snapshots")
+            conn.execute("DROP TABLE cpamp_channels")
         for row in conn.execute("SELECT id FROM opencode_accounts").fetchall():
             conn.execute(
                 """
@@ -356,6 +677,12 @@ class CPAChannelRow:
     name: str
     base_url: str
     management_key: str
+    cpamp_base_url: str | None
+    cpamp_management_key: str | None
+    quota_source: str
+    source_revision: int
+    cpa_endpoint_revision: int
+    cpamp_endpoint_revision: int
     enabled: bool
     collection_revision: int
     interval_sec: int
@@ -364,11 +691,94 @@ class CPAChannelRow:
     last_attempt_status: str | None
     stale: bool
     error: str | None
+    queue_status: str
+    queue_enabled: bool
+    exclusive_confirmed_at: str | None
+    queue_last_poll_at: str | None
+    queue_last_event_at: str | None
+    queue_last_error_code: str | None
+    snapshot_source: str | None
+    last_source_snapshot_at: str | None
     created_at: str
     updated_at: str
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> CPAChannelRow:
+        keys = set(row.keys())
+        return cls(
+            id=row["id"],
+            public_id=row["public_id"],
+            name=row["name"],
+            base_url=row["base_url"],
+            management_key=(
+                decrypt_secret(row["management_key"])
+                if row["management_key"]
+                else ""
+            ),
+            cpamp_base_url=row["cpamp_base_url"] if "cpamp_base_url" in keys else None,
+            cpamp_management_key=(
+                decrypt_secret(row["cpamp_management_key"])
+                if "cpamp_management_key" in keys and row["cpamp_management_key"]
+                else None
+            ),
+            quota_source=(row["quota_source"] if "quota_source" in keys else None)
+            or "none",
+            source_revision=max(1, int(row["source_revision"]))
+            if "source_revision" in keys
+            else 1,
+            cpa_endpoint_revision=max(1, int(row["cpa_endpoint_revision"]))
+            if "cpa_endpoint_revision" in keys
+            else max(1, int(row["collection_revision"])),
+            cpamp_endpoint_revision=max(1, int(row["cpamp_endpoint_revision"]))
+            if "cpamp_endpoint_revision" in keys
+            else 1,
+            enabled=bool(row["enabled"]),
+            collection_revision=max(1, int(row["collection_revision"])),
+            interval_sec=max(300, int(row["interval_sec"])),
+            last_attempt_at=row["last_attempt_at"],
+            last_success_at=row["last_success_at"],
+            last_attempt_status=row["last_attempt_status"],
+            stale=bool(row["stale"]),
+            error=row["error"],
+            queue_status=row["queue_status"] or "awaiting_confirmation",
+            queue_enabled=bool(row["queue_enabled"]),
+            exclusive_confirmed_at=row["exclusive_confirmed_at"],
+            queue_last_poll_at=row["queue_last_poll_at"],
+            queue_last_event_at=row["queue_last_event_at"],
+            queue_last_error_code=row["queue_last_error_code"],
+            snapshot_source=row["snapshot_source"] if "snapshot_source" in keys else None,
+            last_source_snapshot_at=(
+                row["last_source_snapshot_at"]
+                if "last_source_snapshot_at" in keys
+                else None
+            ),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
+class CPAMPChannelRow:
+    id: str
+    public_id: str
+    name: str
+    base_url: str
+    management_key: str
+    enabled: bool
+    collection_revision: int
+    interval_sec: int
+    last_attempt_at: str | None
+    last_success_at: str | None
+    last_attempt_status: str | None
+    stale: bool
+    error: str | None
+    snapshot_source: str | None
+    last_source_snapshot_at: str | None
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> CPAMPChannelRow:
         return cls(
             id=row["id"],
             public_id=row["public_id"],
@@ -383,9 +793,38 @@ class CPAChannelRow:
             last_attempt_status=row["last_attempt_status"],
             stale=bool(row["stale"]),
             error=row["error"],
+            snapshot_source=row["snapshot_source"],
+            last_source_snapshot_at=row["last_source_snapshot_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+
+@dataclass(frozen=True)
+class CPAMPDiscoveryAccount:
+    account_key_hash: str
+    legacy_account_key_hashes: tuple[str, ...]
+    locator_hash: str
+    subject_hash: str
+    account_display: str
+    plan: str
+
+
+@dataclass(frozen=True)
+class CPADiscoveryAccount:
+    account_key_hash: str
+    legacy_account_key_hashes: tuple[str, ...]
+    locator_hash: str
+    subject_hash: str
+    account_display: str
+    plan: str
+
+
+@dataclass(frozen=True)
+class SnapshotWriteResult:
+    public_id: str
+    applied: bool
+    reason: str | None = None
 
 
 @dataclass
@@ -764,29 +1203,52 @@ def get_cpa_channel(channel_id: str) -> CPAChannelRow | None:
 def create_cpa_channel(
     *,
     name: str,
-    base_url: str,
-    management_key: str,
+    base_url: str = "",
+    management_key: str = "",
+    cpamp_base_url: str | None = None,
+    cpamp_management_key: str | None = None,
+    quota_source: str = "none",
+    confirm_exclusive: bool = False,
     enabled: bool = True,
     interval_sec: int = 1800,
 ) -> CPAChannelRow:
+    if quota_source not in {"none", "native_queue", "cpamp_snapshot"}:
+        raise ValueError("无效的 CPA 额度来源")
+    if quota_source in {"none", "native_queue"} and (not base_url or not management_key):
+        raise ValueError("当前额度来源需要 CPA URL 和管理密钥")
+    if quota_source == "cpamp_snapshot" and (
+        not cpamp_base_url or not cpamp_management_key
+    ):
+        raise ValueError("CPAMP 快照来源需要 CPAMP URL 和管理密钥")
+    if quota_source == "native_queue" and enabled and not confirm_exclusive:
+        raise ValueError("启用原生 usage queue 前必须确认独占条件")
     channel_id = str(uuid.uuid4())
     now = _now_iso()
+    queue_active = quota_source == "native_queue" and enabled and confirm_exclusive
     with get_conn() as conn:
         conn.execute(
             """
             INSERT INTO cpa_channels (
-                id, public_id, name, base_url, management_key, enabled,
-                interval_sec, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, public_id, name, base_url, management_key,
+                cpamp_base_url, cpamp_management_key, quota_source, enabled,
+                interval_sec, queue_status, queue_enabled,
+                exclusive_confirmed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 channel_id,
                 str(uuid.uuid4()),
                 name,
                 base_url,
-                encrypt_secret(management_key),
+                encrypt_secret(management_key) if management_key else "",
+                cpamp_base_url,
+                encrypt_secret(cpamp_management_key) if cpamp_management_key else None,
+                quota_source,
                 int(enabled),
                 max(300, int(interval_sec)),
+                "active" if queue_active else "disabled",
+                int(queue_active),
+                now if queue_active else None,
                 now,
                 now,
             ),
@@ -797,7 +1259,15 @@ def create_cpa_channel(
 
 
 def update_cpa_channel(channel_id: str, **fields: Any) -> CPAChannelRow | None:
-    allowed = {"name", "base_url", "management_key", "enabled", "interval_sec"}
+    allowed = {
+        "name",
+        "base_url",
+        "management_key",
+        "cpamp_base_url",
+        "cpamp_management_key",
+        "enabled",
+        "interval_sec",
+    }
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         stored = conn.execute(
@@ -808,11 +1278,13 @@ def update_cpa_channel(channel_id: str, **fields: Any) -> CPAChannelRow | None:
         current = CPAChannelRow.from_row(stored)
         changed: dict[str, Any] = {}
         for key, value in fields.items():
-            if key not in allowed or value is None:
+            if key not in allowed:
                 continue
             normalized = value
-            if key == "management_key":
-                normalized = str(value)
+            if key in {"base_url", "management_key"}:
+                normalized = str(value or "")
+            elif key in {"cpamp_base_url", "cpamp_management_key"}:
+                normalized = str(value) if value else None
             elif key == "enabled":
                 normalized = bool(value)
             elif key == "interval_sec":
@@ -824,26 +1296,338 @@ def update_cpa_channel(channel_id: str, **fields: Any) -> CPAChannelRow | None:
         updates: list[str] = []
         values: list[Any] = []
         for key, value in changed.items():
-            if key == "management_key":
-                value = encrypt_secret(str(value))
+            if key in {"management_key", "cpamp_management_key"}:
+                value = encrypt_secret(str(value)) if value else None
             elif key == "enabled":
                 value = int(bool(value))
             updates.append(f"{key} = ?")
             values.append(value)
-        if {"base_url", "management_key", "enabled"} & changed.keys():
+        cpa_endpoint_changed = bool({"base_url", "management_key"} & changed.keys())
+        cpamp_endpoint_changed = bool(
+            {"cpamp_base_url", "cpamp_management_key"} & changed.keys()
+        )
+        queue_reset = cpa_endpoint_changed or "enabled" in changed
+        if cpa_endpoint_changed:
+            updates.append("cpa_endpoint_revision = cpa_endpoint_revision + 1")
+        if cpamp_endpoint_changed:
+            updates.append("cpamp_endpoint_revision = cpamp_endpoint_revision + 1")
+        selected_endpoint_changed = (
+            cpa_endpoint_changed
+            and current.quota_source in {"none", "native_queue"}
+        ) or (
+            cpamp_endpoint_changed and current.quota_source == "cpamp_snapshot"
+        )
+        if selected_endpoint_changed or "enabled" in changed:
             updates.append("collection_revision = collection_revision + 1")
+        if queue_reset:
+            target_enabled = bool(changed.get("enabled", current.enabled))
+            updates.extend(
+                (
+                    "queue_enabled = 0",
+                    "exclusive_confirmed_at = NULL",
+                    "queue_status = ?",
+                    "queue_last_error_code = NULL",
+                )
+            )
+            values.append(
+                "awaiting_confirmation"
+                if target_enabled and current.quota_source == "native_queue"
+                else "disabled"
+            )
         updates.append("updated_at = ?")
         values.extend((_now_iso(), channel_id))
         conn.execute(
             f"UPDATE cpa_channels SET {', '.join(updates)} WHERE id = ?", values
         )
+        if selected_endpoint_changed:
+            conn.execute(
+                "UPDATE cpa_accounts SET visible = 0, updated_at = ? WHERE channel_id = ?",
+                (_now_iso(), channel_id),
+            )
     return get_cpa_channel(channel_id)
+
+
+def set_cpa_quota_source(
+    channel_id: str,
+    *,
+    source: str,
+    confirm_exclusive: bool = False,
+) -> CPAChannelRow | None:
+    if source not in {"none", "native_queue", "cpamp_snapshot"}:
+        raise ValueError("无效的 CPA 额度来源")
+    now = _now_iso()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        stored = conn.execute(
+            "SELECT * FROM cpa_channels WHERE id = ?", (channel_id,)
+        ).fetchone()
+        if stored is None:
+            return None
+        channel = CPAChannelRow.from_row(stored)
+        if source in {"none", "native_queue"} and (
+            not channel.base_url or not channel.management_key
+        ):
+            raise ValueError("当前额度来源需要 CPA URL 和管理密钥")
+        if source == "cpamp_snapshot" and (
+            not channel.cpamp_base_url or not channel.cpamp_management_key
+        ):
+            raise ValueError("CPAMP 快照来源需要 CPAMP URL 和管理密钥")
+        if source == "native_queue" and channel.enabled and not confirm_exclusive:
+            raise ValueError("启用原生 usage queue 前必须确认独占条件")
+        source_changed = source != channel.quota_source
+        queue_active = bool(
+            source == "native_queue"
+            and channel.enabled
+            and confirm_exclusive
+        )
+        queue_status = (
+            "active"
+            if queue_active
+            else "disabled"
+            if not channel.enabled
+            else "awaiting_confirmation"
+            if source == "native_queue"
+            else "disabled"
+        )
+        conn.execute(
+            """
+            UPDATE cpa_channels
+            SET quota_source = ?,
+                source_revision = source_revision + CASE WHEN ? THEN 1 ELSE 0 END,
+                collection_revision = collection_revision + CASE WHEN ? THEN 1 ELSE 0 END,
+                queue_enabled = ?, exclusive_confirmed_at = ?,
+                queue_status = ?, queue_last_error_code = NULL,
+                last_attempt_at = CASE
+                    WHEN ? THEN NULL
+                    ELSE last_attempt_at
+                END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                source,
+                int(source_changed),
+                int(source_changed),
+                int(queue_active),
+                now if queue_active else None,
+                queue_status,
+                int(source_changed),
+                now,
+                channel_id,
+            ),
+        )
+        if source_changed:
+            conn.execute(
+                "UPDATE cpa_accounts SET visible = 0, updated_at = ? WHERE channel_id = ?",
+                (now, channel_id),
+            )
+    return get_cpa_channel(channel_id)
+
+
+def configure_cpa_usage_queue(
+    channel_id: str,
+    *,
+    enabled: bool,
+    confirm_exclusive: bool = False,
+) -> CPAChannelRow | None:
+    if enabled:
+        return set_cpa_quota_source(
+            channel_id,
+            source="native_queue",
+            confirm_exclusive=confirm_exclusive,
+        )
+    channel = get_cpa_channel(channel_id)
+    if channel is None:
+        return None
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE cpa_channels
+            SET queue_enabled = 0, exclusive_confirmed_at = NULL,
+                queue_status = CASE WHEN enabled = 1
+                    THEN 'awaiting_confirmation' ELSE 'disabled' END,
+                queue_last_error_code = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (_now_iso(), channel_id),
+        )
+    return get_cpa_channel(channel_id)
+
+
+def record_cpa_queue_state(
+    channel_id: str,
+    *,
+    status: str,
+    polled_at: str | None = None,
+    event_at: str | None = None,
+    error_code: str | None = None,
+    expected_collection_revision: int | None = None,
+) -> bool:
+    allowed_statuses = {
+        "active",
+        "empty",
+        "config_disabled",
+        "auth_error",
+        "unsupported",
+        "degraded",
+    }
+    if status not in allowed_statuses:
+        raise ValueError("invalid CPA queue status")
+    updated_at = _now_iso()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _validate_collection_guard(
+            conn,
+            source_table="cpa_channels",
+            source_id=channel_id,
+            expected_collection_revision=expected_collection_revision,
+            lease_name=None,
+            lease_owner_id=None,
+        )
+        row = conn.execute(
+            "SELECT queue_enabled FROM cpa_channels WHERE id = ?", (channel_id,)
+        ).fetchone()
+        if row is None or not bool(row["queue_enabled"]):
+            return False
+        cur = conn.execute(
+            """
+            UPDATE cpa_channels
+            SET queue_status = ?,
+                queue_last_poll_at = CASE
+                    WHEN ? IS NULL THEN queue_last_poll_at
+                    ELSE ?
+                END,
+                queue_last_event_at = CASE
+                    WHEN ? IS NULL THEN queue_last_event_at
+                    WHEN queue_last_event_at IS NULL OR queue_last_event_at < ? THEN ?
+                    ELSE queue_last_event_at
+                END,
+                queue_last_error_code = ?,
+                stale = CASE WHEN ? = 'active' THEN 0 ELSE stale END,
+                updated_at = ?
+            WHERE id = ? AND queue_enabled = 1
+            """,
+            (
+                status,
+                polled_at,
+                polled_at,
+                event_at,
+                event_at,
+                event_at,
+                error_code,
+                status,
+                updated_at,
+                channel_id,
+            ),
+        )
+        if cur.rowcount and status in {
+            "config_disabled",
+            "auth_error",
+            "unsupported",
+            "degraded",
+        }:
+            conn.execute(
+                """
+                UPDATE cpa_channels
+                SET stale = CASE WHEN last_success_at IS NULL THEN 0 ELSE 1 END
+                WHERE id = ?
+                """,
+                (channel_id,),
+            )
+            conn.execute(
+                """
+                UPDATE cpa_quota_snapshots
+                SET stale = CASE WHEN last_success_at IS NULL THEN 0 ELSE 1 END,
+                    updated_at = ?
+                WHERE channel_id = ? AND source_mode = 'native_queue'
+                """,
+                (updated_at, channel_id),
+            )
+        return cur.rowcount > 0
 
 
 def delete_cpa_channel(channel_id: str) -> bool:
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM cpa_channels WHERE id = ?", (channel_id,))
         return cur.rowcount > 0
+
+
+def list_cpamp_channels(*, enabled_only: bool = False) -> list[CPAMPChannelRow]:
+    channels = list_cpa_channels(enabled_only=enabled_only)
+    return [
+        adapted
+        for channel in channels
+        if channel.cpamp_base_url and channel.cpamp_management_key
+        if (adapted := _as_cpamp_channel(channel)) is not None
+    ]
+
+
+def get_cpamp_channel(channel_id: str) -> CPAMPChannelRow | None:
+    channel = get_cpa_channel(channel_id)
+    return _as_cpamp_channel(channel) if channel is not None else None
+
+
+def _as_cpamp_channel(channel: CPAChannelRow) -> CPAMPChannelRow | None:
+    if not channel.cpamp_base_url or not channel.cpamp_management_key:
+        return None
+    return CPAMPChannelRow(
+        id=channel.id,
+        public_id=channel.public_id,
+        name=channel.name,
+        base_url=channel.cpamp_base_url,
+        management_key=channel.cpamp_management_key,
+        enabled=channel.enabled,
+        collection_revision=channel.collection_revision,
+        interval_sec=channel.interval_sec,
+        last_attempt_at=channel.last_attempt_at,
+        last_success_at=channel.last_success_at,
+        last_attempt_status=channel.last_attempt_status,
+        stale=channel.stale,
+        error=channel.error,
+        snapshot_source=channel.snapshot_source,
+        last_source_snapshot_at=channel.last_source_snapshot_at,
+        created_at=channel.created_at,
+        updated_at=channel.updated_at,
+    )
+
+
+def create_cpamp_channel(
+    *,
+    name: str,
+    base_url: str,
+    management_key: str,
+    enabled: bool = True,
+    interval_sec: int = 1800,
+) -> CPAMPChannelRow:
+    channel = create_cpa_channel(
+        name=name,
+        cpamp_base_url=base_url,
+        cpamp_management_key=management_key,
+        quota_source="cpamp_snapshot",
+        enabled=enabled,
+        interval_sec=interval_sec,
+    )
+    adapted = _as_cpamp_channel(channel)
+    assert adapted is not None
+    return adapted
+
+
+def update_cpamp_channel(channel_id: str, **fields: Any) -> CPAMPChannelRow | None:
+    mapped = dict(fields)
+    if "base_url" in mapped:
+        mapped["cpamp_base_url"] = mapped.pop("base_url")
+    if "management_key" in mapped:
+        mapped["cpamp_management_key"] = mapped.pop("management_key")
+    channel = update_cpa_channel(channel_id, **mapped)
+    return _as_cpamp_channel(channel) if channel is not None else None
+
+
+def delete_cpamp_channel(channel_id: str) -> bool:
+    return delete_cpa_channel(channel_id)
+
+
+def mark_cpamp_channel_due(channel_id: str) -> None:
+    mark_cpa_channel_due(channel_id)
 
 
 def mark_cpa_channel_due(channel_id: str) -> None:
@@ -906,24 +1690,26 @@ def record_cpa_channel_attempt(
             UPDATE cpa_quota_snapshots
             SET stale = CASE WHEN last_success_at IS NULL THEN 0 ELSE 1 END,
                 updated_at = ?
-            WHERE channel_id = ?
+            WHERE channel_id = ? AND source_mode = 'native_queue'
             """,
             (now, channel_id),
         )
 
 
-def prepare_cpa_channel_discovery(
+def record_cpamp_channel_attempt(
     channel_id: str,
-    accounts: list[
-        tuple[str, str | tuple[str, ...] | list[str] | None, str, str]
-    ]
-    | None = None,
     *,
+    success: bool,
+    error: str | None = None,
+    attempted_at: str | None = None,
+    snapshot_source: str | None = None,
+    source_snapshot_at: str | None = None,
+    stale: bool = False,
     expected_collection_revision: int | None = None,
     lease_name: str | None = None,
     lease_owner_id: str | None = None,
 ) -> None:
-    now = _now_iso()
+    now = attempted_at or _now_iso()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         _validate_collection_guard(
@@ -934,67 +1720,636 @@ def prepare_cpa_channel_discovery(
             lease_name=lease_name,
             lease_owner_id=lease_owner_id,
         )
+        if success:
+            conn.execute(
+                """
+                UPDATE cpa_channels
+                SET last_attempt_at = ?, last_success_at = ?,
+                    last_attempt_status = 'success', stale = ?, error = NULL,
+                    snapshot_source = COALESCE(?, snapshot_source),
+                    last_source_snapshot_at = CASE
+                        WHEN ? IS NULL THEN last_source_snapshot_at
+                        WHEN last_source_snapshot_at IS NULL
+                            OR last_source_snapshot_at < ? THEN ?
+                        ELSE last_source_snapshot_at
+                    END
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    now,
+                    int(stale),
+                    snapshot_source,
+                    source_snapshot_at,
+                    source_snapshot_at,
+                    source_snapshot_at,
+                    channel_id,
+                ),
+            )
+            if stale:
+                conn.execute(
+                    """
+                    UPDATE cpa_quota_snapshots
+                    SET stale = CASE WHEN last_success_at IS NULL THEN 0 ELSE 1 END,
+                        updated_at = ?
+                    WHERE channel_id = ? AND source_mode = 'cpamp_snapshot'
+                    """,
+                    (now, channel_id),
+                )
+            return
+        conn.execute(
+            """
+            UPDATE cpa_channels
+            SET last_attempt_at = ?, last_attempt_status = 'error',
+                stale = CASE WHEN last_success_at IS NULL THEN 0 ELSE 1 END,
+                error = ?
+            WHERE id = ?
+            """,
+            (now, error, channel_id),
+        )
+        conn.execute(
+            """
+            UPDATE cpa_quota_snapshots
+            SET stale = CASE WHEN last_success_at IS NULL THEN 0 ELSE 1 END,
+                updated_at = ?
+            WHERE channel_id = ? AND source_mode = 'cpamp_snapshot'
+            """,
+            (now, channel_id),
+        )
+
+
+def _coerce_cpamp_discovery_account(
+    value: CPAMPDiscoveryAccount
+    | tuple[str, str | tuple[str, ...] | list[str] | None, str, str],
+) -> CPAMPDiscoveryAccount:
+    if isinstance(value, CPAMPDiscoveryAccount):
+        return value
+    account_key_hash, legacy_values, account_display, plan = value
+    if isinstance(legacy_values, str):
+        legacy_hashes = (legacy_values,)
+    else:
+        legacy_hashes = tuple(legacy_values or ())
+    locator_hash = next(
+        (item for item in legacy_hashes if item and item != account_key_hash),
+        account_key_hash,
+    )
+    return CPAMPDiscoveryAccount(
+        account_key_hash=account_key_hash,
+        legacy_account_key_hashes=legacy_hashes,
+        locator_hash=locator_hash,
+        subject_hash="",
+        account_display=account_display,
+        plan=plan,
+    )
+
+
+def prepare_cpamp_channel_discovery(
+    channel_id: str,
+    accounts: list[
+        CPAMPDiscoveryAccount
+        | tuple[str, str | tuple[str, ...] | list[str] | None, str, str]
+    ]
+    | None = None,
+    *,
+    expected_collection_revision: int | None = None,
+    lease_name: str | None = None,
+    lease_owner_id: str | None = None,
+) -> None:
+    prepare_cpa_channel_discovery(
+        channel_id,
+        [
+            CPADiscoveryAccount(
+                account_key_hash=account.account_key_hash,
+                legacy_account_key_hashes=account.legacy_account_key_hashes,
+                locator_hash=account.locator_hash,
+                subject_hash=account.subject_hash,
+                account_display=account.account_display,
+                plan=account.plan,
+            )
+            for account in (
+                _coerce_cpamp_discovery_account(value) for value in accounts or []
+            )
+        ],
+        source_mode="cpamp_snapshot",
+        expected_collection_revision=expected_collection_revision,
+        lease_name=lease_name,
+        lease_owner_id=lease_owner_id,
+    )
+
+
+def record_cpamp_quota_snapshot(
+    channel_id: str,
+    account_key_hash: str,
+    *,
+    account_display: str,
+    plan: str,
+    success: bool,
+    windows: list[dict[str, Any]] | None = None,
+    error: str | None = None,
+    attempted_at: str | None = None,
+    quota_source: str | None = None,
+    observed_at: str | None = None,
+    stale: bool = False,
+    expected_collection_revision: int | None = None,
+    lease_name: str | None = None,
+    lease_owner_id: str | None = None,
+) -> SnapshotWriteResult:
+    with get_conn() as conn:
+        channel_row = conn.execute(
+            "SELECT cpamp_endpoint_revision FROM cpa_channels WHERE id = ?",
+            (channel_id,),
+        ).fetchone()
+        endpoint_revision = (
+            max(1, int(channel_row["cpamp_endpoint_revision"]))
+            if channel_row is not None
+            else 1
+        )
+        storage_hash = _snapshot_storage_hash(
+            "cpamp_snapshot", account_key_hash, endpoint_revision
+        )
+        existing = conn.execute(
+            """
+            SELECT public_id, observed_at, accept_observed_after
+            FROM cpa_quota_snapshots
+            WHERE channel_id = ? AND account_key_hash = ?
+                AND source_mode = 'cpamp_snapshot'
+            """,
+            (channel_id, storage_hash),
+        ).fetchone()
+        if success and existing is not None:
+            if existing["accept_observed_after"] and (
+                not observed_at
+                or _compare_observations(
+                    observed_at, existing["accept_observed_after"]
+                )
+                < 0
+            ):
+                return SnapshotWriteResult(
+                    public_id=existing["public_id"],
+                    applied=False,
+                    reason="identity_observation_too_old",
+                )
+            if _compare_observations(observed_at, existing["observed_at"]) < 0:
+                return SnapshotWriteResult(
+                    public_id=existing["public_id"],
+                    applied=False,
+                    reason="observation_older_than_snapshot",
+                )
+    public_id = record_cpa_quota_snapshot(
+        channel_id,
+        account_key_hash,
+        account_display=account_display,
+        plan=plan,
+        success=success,
+        windows=windows,
+        error=error,
+        attempted_at=attempted_at,
+        quota_source=quota_source,
+        observed_at=observed_at,
+        source_mode="cpamp_snapshot",
+        stale=stale,
+        endpoint_revision=endpoint_revision,
+        expected_collection_revision=expected_collection_revision,
+        lease_name=lease_name,
+        lease_owner_id=lease_owner_id,
+    )
+    return SnapshotWriteResult(public_id=public_id, applied=True)
+
+
+def list_cpamp_snapshot_identities(
+    channel_id: str,
+) -> list[CPAMPDiscoveryAccount]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.canonical_account_hash, s.locator_hash, s.subject_hash,
+                s.account_display, s.plan
+            FROM cpa_quota_snapshots s
+            JOIN cpa_channels c ON c.id = s.channel_id
+            WHERE s.channel_id = ? AND s.source_mode = 'cpamp_snapshot'
+                AND s.endpoint_revision = c.cpamp_endpoint_revision
+                AND s.visible = 1 AND s.locator_hash IS NOT NULL
+            ORDER BY s.created_at ASC
+            """,
+            (channel_id,),
+        ).fetchall()
+    return [
+        CPAMPDiscoveryAccount(
+            account_key_hash=row["canonical_account_hash"],
+            legacy_account_key_hashes=(),
+            locator_hash=row["locator_hash"],
+            subject_hash=row["subject_hash"] or "",
+            account_display=row["account_display"],
+            plan=row["plan"],
+        )
+        for row in rows
+    ]
+
+
+def _coerce_cpa_discovery_account(
+    value: CPADiscoveryAccount
+    | tuple[str, str | tuple[str, ...] | list[str] | None, str, str],
+) -> CPADiscoveryAccount:
+    if isinstance(value, CPADiscoveryAccount):
+        return value
+    account_key_hash, legacy_values, account_display, plan = value
+    if isinstance(legacy_values, str):
+        legacy_hashes = (legacy_values,)
+    else:
+        legacy_hashes = tuple(legacy_values or ())
+    locator_hash = next(
+        (item for item in legacy_hashes if item and item != account_key_hash),
+        account_key_hash,
+    )
+    return CPADiscoveryAccount(
+        account_key_hash=account_key_hash,
+        legacy_account_key_hashes=legacy_hashes,
+        locator_hash=locator_hash,
+        subject_hash="",
+        account_display=account_display,
+        plan=plan,
+    )
+
+
+def _snapshot_storage_hash(
+    source_mode: str, canonical_account_hash: str, endpoint_revision: int = 1
+) -> str:
+    endpoint_revision = max(1, int(endpoint_revision))
+    if endpoint_revision > 1:
+        return keyed_fingerprint(
+            "cpa-snapshot-generation-v1",
+            f"{source_mode}\0{endpoint_revision}\0{canonical_account_hash}",
+        )
+    if source_mode == "native_queue":
+        return canonical_account_hash
+    return keyed_fingerprint(
+        f"cpa-snapshot-{source_mode}-v1", canonical_account_hash
+    )
+
+
+def _upsert_cpa_account(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: str,
+    canonical_account_hash: str,
+    locator_hash: str,
+    subject_hash: str,
+    account_display: str,
+    plan: str,
+    visible: bool | None,
+    now: str,
+) -> str:
+    existing = conn.execute(
+        """
+        SELECT canonical_account_hash, public_id
+        FROM cpa_accounts
+        WHERE channel_id = ? AND canonical_account_hash = ?
+        """,
+        (channel_id, canonical_account_hash),
+    ).fetchone()
+    if existing is None and subject_hash:
+        existing = conn.execute(
+            """
+            SELECT canonical_account_hash, public_id
+            FROM cpa_accounts
+            WHERE channel_id = ? AND subject_hash = ?
+            ORDER BY created_at ASC LIMIT 1
+            """,
+            (channel_id, subject_hash),
+        ).fetchone()
+    if existing is not None:
+        stable_hash = str(existing["canonical_account_hash"])
+        conn.execute(
+            """
+            UPDATE cpa_accounts
+            SET locator_hash = COALESCE(NULLIF(?, ''), locator_hash),
+                subject_hash = COALESCE(NULLIF(?, ''), subject_hash),
+                account_display = ?,
+                plan = CASE WHEN plan = '未知套餐' THEN ? ELSE plan END,
+                visible = COALESCE(?, visible), updated_at = ?
+            WHERE channel_id = ? AND canonical_account_hash = ?
+            """,
+            (
+                locator_hash,
+                subject_hash,
+                account_display,
+                plan,
+                None if visible is None else int(visible),
+                now,
+                channel_id,
+                stable_hash,
+            ),
+        )
+        return stable_hash
+    public_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO cpa_accounts (
+            channel_id, canonical_account_hash, public_id, account_display,
+            plan, locator_hash, subject_hash, visible, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            channel_id,
+            canonical_account_hash,
+            public_id,
+            account_display,
+            plan,
+            locator_hash or None,
+            subject_hash or None,
+            int(bool(visible)),
+            now,
+            now,
+        ),
+    )
+    return canonical_account_hash
+
+
+def prepare_cpa_channel_discovery(
+    channel_id: str,
+    accounts: list[
+        CPADiscoveryAccount
+        | tuple[str, str | tuple[str, ...] | list[str] | None, str, str]
+    ]
+    | None = None,
+    *,
+    source_mode: str = "native_queue",
+    expected_collection_revision: int | None = None,
+    lease_name: str | None = None,
+    lease_owner_id: str | None = None,
+) -> None:
+    if source_mode not in {"native_queue", "cpamp_snapshot"}:
+        raise ValueError("invalid CPA discovery source")
+    now = _now_iso()
+    normalized_accounts = [
+        _coerce_cpa_discovery_account(account) for account in accounts or []
+    ]
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _validate_collection_guard(
+            conn,
+            source_table="cpa_channels",
+            source_id=channel_id,
+            expected_collection_revision=expected_collection_revision,
+            lease_name=lease_name,
+            lease_owner_id=lease_owner_id,
+        )
+        channel_row = conn.execute(
+            """
+            SELECT cpa_endpoint_revision, cpamp_endpoint_revision
+            FROM cpa_channels WHERE id = ?
+            """,
+            (channel_id,),
+        ).fetchone()
+        if channel_row is None:
+            raise CollectionGuardRejected("source_changed")
+        endpoint_revision = int(
+            channel_row[
+                "cpamp_endpoint_revision"
+                if source_mode == "cpamp_snapshot"
+                else "cpa_endpoint_revision"
+            ]
+        )
+        previously_visible = conn.execute(
+            """
+            SELECT account_key_hash, canonical_account_hash, locator_hash, subject_hash
+            FROM cpa_quota_snapshots
+            WHERE channel_id = ? AND source_mode = ? AND visible = 1
+            """,
+            (channel_id, source_mode),
+        ).fetchall()
+        conn.execute(
+            "UPDATE cpa_accounts SET visible = 0, updated_at = ? WHERE channel_id = ?",
+            (now, channel_id),
+        )
         conn.execute(
             """
             UPDATE cpa_quota_snapshots
             SET visible = 0,
-                stale = CASE WHEN last_success_at IS NULL THEN 0 ELSE 1 END,
+                stale = CASE
+                    WHEN source_mode = 'cpamp_snapshot' AND last_success_at IS NOT NULL THEN 1
+                    ELSE stale
+                END,
                 updated_at = ?
-            WHERE channel_id = ?
+            WHERE channel_id = ? AND source_mode = ?
             """,
-            (now, channel_id),
+            (now, channel_id, source_mode),
         )
-        for account_key_hash, legacy_values, account_display, plan in accounts or []:
-            if isinstance(legacy_values, str):
-                legacy_hashes = (legacy_values,)
-            else:
-                legacy_hashes = tuple(legacy_values or ())
-            legacy_hashes = tuple(
+        for account in normalized_accounts:
+            legacy_canonical_hashes = tuple(
                 value
-                for value in dict.fromkeys(legacy_hashes)
-                if value and value != account_key_hash
+                for value in dict.fromkeys(account.legacy_account_key_hashes)
+                if value and value != account.account_key_hash
             )
+            current_account = conn.execute(
+                """
+                SELECT canonical_account_hash FROM cpa_accounts
+                WHERE channel_id = ? AND canonical_account_hash = ?
+                """,
+                (channel_id, account.account_key_hash),
+            ).fetchone()
+            if current_account is None:
+                for legacy_canonical_hash in legacy_canonical_hashes:
+                    legacy_account = conn.execute(
+                        """
+                        SELECT subject_hash FROM cpa_accounts
+                        WHERE channel_id = ? AND canonical_account_hash = ?
+                        """,
+                        (channel_id, legacy_canonical_hash),
+                    ).fetchone()
+                    if legacy_account is None or (
+                        legacy_account["subject_hash"]
+                        and account.subject_hash
+                        and legacy_account["subject_hash"] != account.subject_hash
+                    ):
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE cpa_accounts
+                        SET canonical_account_hash = ?
+                        WHERE channel_id = ? AND canonical_account_hash = ?
+                        """,
+                        (account.account_key_hash, channel_id, legacy_canonical_hash),
+                    )
+                    break
+            canonical_account_hash = _upsert_cpa_account(
+                conn,
+                channel_id=channel_id,
+                canonical_account_hash=account.account_key_hash,
+                locator_hash=account.locator_hash,
+                subject_hash=account.subject_hash,
+                account_display=account.account_display,
+                plan=account.plan,
+                visible=True,
+                now=now,
+            )
+            account_key_hash = _snapshot_storage_hash(
+                source_mode, canonical_account_hash, endpoint_revision
+            )
+            legacy_hashes = tuple(
+                _snapshot_storage_hash(source_mode, value, endpoint_revision)
+                for value in legacy_canonical_hashes
+                if value != canonical_account_hash
+            )
+            replacement = False
+            for visible in previously_visible:
+                same_locator = bool(account.locator_hash) and (
+                    visible["locator_hash"] == account.locator_hash
+                    or visible["account_key_hash"] in legacy_hashes
+                )
+                if not same_locator:
+                    continue
+                same_identity = (
+                    visible["canonical_account_hash"] == canonical_account_hash
+                    or visible["account_key_hash"] == account_key_hash
+                )
+                if visible["account_key_hash"] in legacy_hashes:
+                    same_identity = not (
+                        visible["subject_hash"]
+                        and account.subject_hash
+                        and visible["subject_hash"] != account.subject_hash
+                    )
+                if not same_identity:
+                    replacement = True
+                    break
             current = conn.execute(
                 """
-                SELECT 1 FROM cpa_quota_snapshots
-                WHERE channel_id = ? AND account_key_hash = ?
+                SELECT account_key_hash FROM cpa_quota_snapshots
+                WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
                 """,
-                (channel_id, account_key_hash),
+                (channel_id, account_key_hash, source_mode),
             ).fetchone()
+            if replacement and current is not None:
+                conn.execute(
+                    """
+                    DELETE FROM cpa_quota_snapshots
+                    WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
+                    """,
+                    (channel_id, account_key_hash, source_mode),
+                )
+                current = None
             if current is None:
                 for legacy_hash in legacy_hashes:
+                    legacy = conn.execute(
+                        """
+                        SELECT subject_hash FROM cpa_quota_snapshots
+                        WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
+                        """,
+                        (channel_id, legacy_hash, source_mode),
+                    ).fetchone()
+                    if legacy is None or (
+                        legacy["subject_hash"]
+                        and account.subject_hash
+                        and legacy["subject_hash"] != account.subject_hash
+                    ):
+                        continue
                     cur = conn.execute(
                         """
                         UPDATE cpa_quota_snapshots
-                        SET account_key_hash = ?
-                        WHERE channel_id = ? AND account_key_hash = ?
+                        SET account_key_hash = ?, locator_hash = ?,
+                            subject_hash = COALESCE(NULLIF(?, ''), subject_hash),
+                            canonical_account_hash = ?, source_mode = ?,
+                            endpoint_revision = ?
+                        WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
                         """,
-                        (account_key_hash, channel_id, legacy_hash),
+                        (
+                            account_key_hash,
+                            account.locator_hash,
+                            account.subject_hash,
+                            canonical_account_hash,
+                            source_mode,
+                            endpoint_revision,
+                            channel_id,
+                            legacy_hash,
+                            source_mode,
+                        ),
                     )
                     if cur.rowcount:
-                        current = True
+                        current = conn.execute(
+                            """
+                            SELECT account_key_hash FROM cpa_quota_snapshots
+                            WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
+                            """,
+                            (channel_id, account_key_hash, source_mode),
+                        ).fetchone()
                         break
             if current is not None:
                 for legacy_hash in legacy_hashes:
+                    legacy = conn.execute(
+                        """
+                        SELECT subject_hash FROM cpa_quota_snapshots
+                        WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
+                        """,
+                        (channel_id, legacy_hash, source_mode),
+                    ).fetchone()
+                    if legacy is None or (
+                        legacy["subject_hash"]
+                        and account.subject_hash
+                        and legacy["subject_hash"] != account.subject_hash
+                    ):
+                        continue
                     conn.execute(
                         """
                         DELETE FROM cpa_quota_snapshots
-                        WHERE channel_id = ? AND account_key_hash = ?
+                        WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
                         """,
-                        (channel_id, legacy_hash),
+                        (channel_id, legacy_hash, source_mode),
                     )
             conn.execute(
                 """
-                UPDATE cpa_quota_snapshots
-                SET account_display = ?, plan = ?,
-                    visible = CASE
-                        WHEN last_attempt_status IS NULL AND last_success_at IS NULL
-                        THEN visible ELSE 1
-                    END,
-                    updated_at = ?
-                WHERE channel_id = ? AND account_key_hash = ?
+                INSERT INTO cpa_quota_snapshots (
+                    channel_id, account_key_hash, canonical_account_hash,
+                    source_mode, endpoint_revision, locator_hash, subject_hash,
+                    public_id, account_display, plan, windows_json, visible,
+                    accept_observed_after, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 1, ?, ?, ?)
+                ON CONFLICT(channel_id, account_key_hash) DO NOTHING
                 """,
-                (account_display, plan, now, channel_id, account_key_hash),
+                (
+                    channel_id,
+                    account_key_hash,
+                    canonical_account_hash,
+                    source_mode,
+                    endpoint_revision,
+                    account.locator_hash,
+                    account.subject_hash or None,
+                    str(uuid.uuid4()),
+                    account.account_display,
+                    account.plan,
+                    now if replacement else None,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE cpa_quota_snapshots
+                SET locator_hash = ?,
+                    subject_hash = COALESCE(NULLIF(?, ''), subject_hash),
+                    canonical_account_hash = ?, source_mode = ?,
+                    endpoint_revision = ?,
+                    account_display = ?,
+                    plan = CASE
+                        WHEN last_success_at IS NULL OR plan = '未知套餐' THEN ?
+                        ELSE plan
+                    END,
+                    visible = 1,
+                    updated_at = ?
+                WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
+                """,
+                (
+                    account.locator_hash,
+                    account.subject_hash,
+                    canonical_account_hash,
+                    source_mode,
+                    endpoint_revision,
+                    account.account_display,
+                    account.plan,
+                    now,
+                    channel_id,
+                    account_key_hash,
+                    source_mode,
+                ),
             )
 
 
@@ -1011,10 +2366,14 @@ def record_cpa_quota_snapshot(
     quota_source: str | None = None,
     observed_at: str | None = None,
     active_attempted: bool = False,
+    source_mode: str = "native_queue",
+    stale: bool = False,
+    endpoint_revision: int | None = None,
     expected_collection_revision: int | None = None,
     lease_name: str | None = None,
     lease_owner_id: str | None = None,
 ) -> str:
+    canonical_account_hash = account_key_hash
     now = attempted_at or _now_iso()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -1026,25 +2385,108 @@ def record_cpa_quota_snapshot(
             lease_name=lease_name,
             lease_owner_id=lease_owner_id,
         )
+        channel_row = conn.execute(
+            """
+            SELECT cpa_endpoint_revision, cpamp_endpoint_revision
+            FROM cpa_channels WHERE id = ?
+            """,
+            (channel_id,),
+        ).fetchone()
+        if channel_row is None:
+            raise CollectionGuardRejected("source_changed")
+        current_endpoint_revision = int(
+            channel_row[
+                "cpamp_endpoint_revision"
+                if source_mode == "cpamp_snapshot"
+                else "cpa_endpoint_revision"
+            ]
+        )
+        if endpoint_revision is None:
+            endpoint_revision = current_endpoint_revision
+        canonical_account_hash = _upsert_cpa_account(
+            conn,
+            channel_id=channel_id,
+            canonical_account_hash=canonical_account_hash,
+            locator_hash="",
+            subject_hash="",
+            account_display=account_display,
+            plan=plan,
+            visible=True,
+            now=now,
+        )
+        account_key_hash = _snapshot_storage_hash(
+            source_mode, canonical_account_hash, endpoint_revision
+        )
         existing = conn.execute(
             """
-            SELECT public_id, last_success_at
+            SELECT public_id, last_success_at, observed_at, accept_observed_after
             FROM cpa_quota_snapshots
-            WHERE channel_id = ? AND account_key_hash = ?
+            WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
             """,
-            (channel_id, account_key_hash),
+            (channel_id, account_key_hash, source_mode),
         ).fetchone()
         public_id = existing["public_id"] if existing else str(uuid.uuid4())
+        if (
+            success
+            and existing is not None
+            and existing["accept_observed_after"]
+            and (
+                not observed_at
+                or _compare_observations(
+                    observed_at, existing["accept_observed_after"]
+                )
+                < 0
+            )
+        ):
+            return public_id
+        observation_order = (
+            _compare_observations(observed_at, existing["observed_at"])
+            if success and existing is not None
+            else 1
+        )
+        if (
+            success
+            and existing is not None
+            and observation_order < 0
+        ):
+            return public_id
+        if success and existing is not None and observation_order == 0:
+            conn.execute(
+                """
+                UPDATE cpa_quota_snapshots
+                SET visible = 1,
+                    last_attempt_at = ?,
+                    last_success_at = ?,
+                    last_attempt_status = 'success',
+                    stale = ?,
+                    error = NULL,
+                    last_active_attempt_at = COALESCE(?, last_active_attempt_at),
+                    updated_at = ?
+                WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
+                """,
+                (
+                    now,
+                    now,
+                    int(stale),
+                    now if active_attempted else None,
+                    now,
+                    channel_id,
+                    account_key_hash,
+                    source_mode,
+                ),
+            )
+            return public_id
         created_at = now if existing is None else None
         if success:
             conn.execute(
                 """
                 INSERT INTO cpa_quota_snapshots (
-                    channel_id, account_key_hash, public_id, account_display, plan,
+                    channel_id, account_key_hash, canonical_account_hash,
+                    source_mode, endpoint_revision, public_id, account_display, plan,
                     windows_json, visible, last_attempt_at, last_success_at,
                     last_attempt_status, stale, error, quota_source, observed_at,
                     last_active_attempt_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'success', 0, NULL, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'success', ?, NULL, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel_id, account_key_hash) DO UPDATE SET
                     account_display = excluded.account_display,
                     plan = excluded.plan,
@@ -1053,7 +2495,7 @@ def record_cpa_quota_snapshot(
                     last_attempt_at = excluded.last_attempt_at,
                     last_success_at = excluded.last_success_at,
                     last_attempt_status = 'success',
-                    stale = 0,
+                    stale = excluded.stale,
                     error = NULL,
                     quota_source = COALESCE(excluded.quota_source, cpa_quota_snapshots.quota_source),
                     observed_at = COALESCE(excluded.observed_at, cpa_quota_snapshots.observed_at),
@@ -1066,12 +2508,16 @@ def record_cpa_quota_snapshot(
                 (
                     channel_id,
                     account_key_hash,
+                    canonical_account_hash,
+                    source_mode,
+                    endpoint_revision,
                     public_id,
                     account_display,
                     plan,
                     json.dumps(windows or [], ensure_ascii=False),
                     now,
                     now,
+                    int(stale),
                     quota_source,
                     observed_at,
                     now if active_attempted else None,
@@ -1083,11 +2529,12 @@ def record_cpa_quota_snapshot(
         conn.execute(
             """
             INSERT INTO cpa_quota_snapshots (
-                channel_id, account_key_hash, public_id, account_display, plan,
+                channel_id, account_key_hash, canonical_account_hash,
+                source_mode, endpoint_revision, public_id, account_display, plan,
                 windows_json, visible, last_attempt_at, last_attempt_status,
                 stale, error, quota_source, observed_at, last_active_attempt_at,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, '[]', 1, ?, 'error', 0, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', 1, ?, 'error', 0, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id, account_key_hash) DO UPDATE SET
                 account_display = excluded.account_display,
                 plan = excluded.plan,
@@ -1109,6 +2556,9 @@ def record_cpa_quota_snapshot(
             (
                 channel_id,
                 account_key_hash,
+                canonical_account_hash,
+                source_mode,
+                endpoint_revision,
                 public_id,
                 account_display,
                 plan,
@@ -1122,6 +2572,159 @@ def record_cpa_quota_snapshot(
             ),
         )
         return public_id
+
+
+def record_cpa_quota_batch(
+    channel_id: str,
+    snapshots: list[dict[str, Any]],
+    *,
+    attempted_at: str | None = None,
+    expected_collection_revision: int | None = None,
+    endpoint_revision: int | None = None,
+) -> list[SnapshotWriteResult]:
+    now = attempted_at or _now_iso()
+    results: list[SnapshotWriteResult] = []
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        channel_row = conn.execute(
+            """
+            SELECT quota_source, cpa_endpoint_revision
+            FROM cpa_channels WHERE id = ?
+            """,
+            (channel_id,),
+        ).fetchone()
+        if channel_row is None:
+            raise CollectionGuardRejected("source_deleted")
+        current_endpoint_revision = int(channel_row["cpa_endpoint_revision"])
+        if endpoint_revision is None:
+            endpoint_revision = current_endpoint_revision
+        current_native_generation = (
+            channel_row["quota_source"] == "native_queue"
+            and endpoint_revision == current_endpoint_revision
+        )
+        for snapshot in snapshots:
+            canonical_account_hash = str(snapshot["account_key_hash"])
+            account_display = str(snapshot["account_display"])
+            plan = str(snapshot["plan"])
+            observed_at = str(snapshot["observed_at"])
+            windows = snapshot.get("windows")
+            canonical_account_hash = _upsert_cpa_account(
+                conn,
+                channel_id=channel_id,
+                canonical_account_hash=canonical_account_hash,
+                locator_hash="",
+                subject_hash="",
+                account_display=account_display,
+                plan=plan,
+                visible=True if current_native_generation else None,
+                now=now,
+            )
+            account_key_hash = _snapshot_storage_hash(
+                "native_queue", canonical_account_hash, endpoint_revision
+            )
+            existing = conn.execute(
+                """
+                SELECT public_id, observed_at, accept_observed_after
+                FROM cpa_quota_snapshots
+                WHERE channel_id = ? AND account_key_hash = ?
+                    AND source_mode = 'native_queue'
+                """,
+                (channel_id, account_key_hash),
+            ).fetchone()
+            public_id = existing["public_id"] if existing else str(uuid.uuid4())
+            if (
+                existing is not None
+                and existing["accept_observed_after"]
+                and _compare_observations(
+                    observed_at, existing["accept_observed_after"]
+                )
+                < 0
+            ):
+                results.append(
+                    SnapshotWriteResult(
+                        public_id=public_id,
+                        applied=False,
+                        reason="identity_observation_too_old",
+                    )
+                )
+                continue
+            observation_order = (
+                _compare_observations(observed_at, existing["observed_at"])
+                if existing is not None
+                else 1
+            )
+            if existing is not None and observation_order < 0:
+                results.append(
+                    SnapshotWriteResult(
+                        public_id=public_id,
+                        applied=False,
+                        reason="observation_older_than_snapshot",
+                    )
+                )
+                continue
+            if existing is not None and observation_order == 0:
+                conn.execute(
+                    """
+                    UPDATE cpa_quota_snapshots
+                    SET visible = 1,
+                        last_attempt_at = ?,
+                        last_success_at = ?,
+                        last_attempt_status = 'success',
+                        stale = 0,
+                        error = NULL,
+                        updated_at = ?
+                    WHERE channel_id = ? AND account_key_hash = ?
+                        AND source_mode = 'native_queue'
+                    """,
+                    (now, now, now, channel_id, account_key_hash),
+                )
+                results.append(SnapshotWriteResult(public_id=public_id, applied=True))
+                continue
+            conn.execute(
+                """
+                INSERT INTO cpa_quota_snapshots (
+                    channel_id, account_key_hash, canonical_account_hash,
+                    source_mode, endpoint_revision, public_id, account_display, plan,
+                    windows_json, visible, last_attempt_at, last_success_at,
+                    last_attempt_status, stale, error, quota_source, observed_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 'native_queue', ?, ?, ?, ?, ?, 1, ?, ?,
+                    'success', 0, NULL, 'usage_queue', ?, ?, ?)
+                ON CONFLICT(channel_id, account_key_hash) DO UPDATE SET
+                    canonical_account_hash = excluded.canonical_account_hash,
+                    source_mode = 'native_queue',
+                    endpoint_revision = excluded.endpoint_revision,
+                    account_display = excluded.account_display,
+                    plan = excluded.plan,
+                    windows_json = excluded.windows_json,
+                    visible = 1,
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_success_at = excluded.last_success_at,
+                    last_attempt_status = 'success',
+                    stale = 0,
+                    error = NULL,
+                    quota_source = 'usage_queue',
+                    observed_at = excluded.observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    channel_id,
+                    account_key_hash,
+                    canonical_account_hash,
+                    endpoint_revision,
+                    public_id,
+                    account_display,
+                    plan,
+                    json.dumps(windows if isinstance(windows, list) else [], ensure_ascii=False),
+                    now,
+                    now,
+                    observed_at,
+                    now,
+                    now,
+                ),
+            )
+            results.append(SnapshotWriteResult(public_id=public_id, applied=True))
+    return results
 
 
 def get_cpa_active_attempt(
@@ -1202,23 +2805,40 @@ def list_cached_cpa_channels(*, enabled_only: bool = True) -> list[dict[str, Any
         channel_rows = conn.execute(
             f"SELECT * FROM cpa_channels c {where} ORDER BY c.created_at ASC"
         ).fetchall()
-        snapshot_rows = conn.execute(
+        account_rows = conn.execute(
             """
-            SELECT * FROM cpa_quota_snapshots
-            WHERE visible = 1
-            ORDER BY created_at ASC
+            SELECT a.channel_id, a.public_id AS account_public_id,
+                a.account_display AS discovered_display,
+                a.plan AS discovered_plan,
+                s.account_display, s.plan, s.windows_json,
+                s.last_attempt_at, s.last_success_at, s.last_attempt_status,
+                s.stale, s.error, s.quota_source, s.observed_at
+            FROM cpa_accounts a
+            JOIN cpa_channels c ON c.id = a.channel_id
+            LEFT JOIN cpa_quota_snapshots s
+                ON s.channel_id = a.channel_id
+                AND s.canonical_account_hash = a.canonical_account_hash
+                AND s.source_mode = c.quota_source
+                AND s.endpoint_revision = CASE
+                    WHEN c.quota_source = 'cpamp_snapshot'
+                        THEN c.cpamp_endpoint_revision
+                    ELSE c.cpa_endpoint_revision
+                END
+                AND s.visible = 1
+            WHERE a.visible = 1
+            ORDER BY a.created_at ASC
             """
         ).fetchall()
     snapshots_by_channel: dict[str, list[dict[str, Any]]] = {}
-    for row in snapshot_rows:
+    for row in account_rows:
         success = row["last_attempt_status"] == "success"
         item: dict[str, Any] = {
-            "public_id": row["public_id"],
-            "account": row["account_display"],
-            "plan": row["plan"],
+            "public_id": row["account_public_id"],
+            "account": row["account_display"] or row["discovered_display"],
+            "plan": row["plan"] or row["discovered_plan"],
             "success": success,
             "stale": bool(row["stale"]),
-            "updated_at": row["last_success_at"] or row["last_attempt_at"] or "",
+            "updated_at": row["last_success_at"] or "",
             "last_attempt_at": row["last_attempt_at"],
             "windows": _decode_windows(row["windows_json"] or "[]"),
         }
@@ -1227,7 +2847,7 @@ def list_cached_cpa_channels(*, enabled_only: bool = True) -> list[dict[str, Any
         if row["observed_at"]:
             item["observed_at"] = row["observed_at"]
         if not success:
-            item["error"] = row["error"] or "等待首次采集"
+            item["error"] = row["error"] or "等待当前来源的首次额度数据"
         snapshots_by_channel.setdefault(row["channel_id"], []).append(item)
 
     result: list[dict[str, Any]] = []
@@ -1240,18 +2860,47 @@ def list_cached_cpa_channels(*, enabled_only: bool = True) -> list[dict[str, Any
             "stale": bool(row["stale"]),
             "last_attempt_at": row["last_attempt_at"],
             "last_success_at": row["last_success_at"],
+            "quota_source": row["quota_source"],
+            "source_status": (
+                "discovery_only"
+                if row["quota_source"] == "none"
+                else row["queue_status"]
+                if row["quota_source"] == "native_queue"
+                else row["last_attempt_status"] or "pending"
+            ),
+            "snapshot_source": row["snapshot_source"],
+            "last_source_snapshot_at": row["last_source_snapshot_at"],
             "accounts": snapshots_by_channel.get(row["id"], []),
         }
         if not success:
             item["error"] = row["error"] or "等待首次采集"
         if not enabled_only:
             item["id"] = row["id"]
-            item["url"] = row["base_url"]
+            item["cpa_url"] = row["base_url"] or None
+            item["cpamp_url"] = row["cpamp_base_url"]
             item["enabled"] = bool(row["enabled"])
             item["interval_sec"] = max(300, int(row["interval_sec"]))
+            item["queue_status"] = row["queue_status"]
+            item["queue_enabled"] = bool(row["queue_enabled"])
+            item["exclusive_confirmed_at"] = row["exclusive_confirmed_at"]
+            item["queue_last_poll_at"] = row["queue_last_poll_at"]
+            item["queue_last_event_at"] = row["queue_last_event_at"]
+            item["queue_last_error_code"] = row["queue_last_error_code"]
             item["created_at"] = row["created_at"]
             item["updated_at"] = row["updated_at"]
         result.append(item)
+    return result
+
+
+def list_cached_cpamp_channels(*, enabled_only: bool = True) -> list[dict[str, Any]]:
+    result = [
+        item
+        for item in list_cached_cpa_channels(enabled_only=enabled_only)
+        if item["quota_source"] == "cpamp_snapshot"
+    ]
+    if not enabled_only:
+        for item in result:
+            item["url"] = item.get("cpamp_url")
     return result
 
 
@@ -1608,6 +3257,15 @@ def count_cpa_channels() -> int:
         return int(conn.execute("SELECT COUNT(*) FROM cpa_channels").fetchone()[0])
 
 
+def count_cpamp_channels() -> int:
+    with get_conn() as conn:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM cpa_channels WHERE cpamp_base_url IS NOT NULL"
+            ).fetchone()[0]
+        )
+
+
 def _compact_database_after_secret_migration() -> None:
     conn = sqlite3.connect(db_path())
     try:
@@ -1634,8 +3292,11 @@ def migrate_account_secrets() -> None:
             ("opencode_accounts", "auth_cookie"),
             ("ollama_accounts", "session_cookie"),
             ("cpa_channels", "management_key"),
+            ("cpa_channels", "cpamp_management_key"),
         ):
-            rows = conn.execute(f"SELECT id, {column} FROM {table}").fetchall()
+            rows = conn.execute(
+                f"SELECT id, {column} FROM {table} WHERE {column} IS NOT NULL AND {column} != ''"
+            ).fetchall()
             for row in rows:
                 stored = str(row[column])
                 encrypted = stored if is_encrypted(stored) else encrypt_secret(stored)

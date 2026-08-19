@@ -129,6 +129,47 @@ async def test_scheduler_collects_due_account_once_and_uses_snapshot(temp_data_d
 
 
 @pytest.mark.asyncio
+async def test_scheduler_dispatches_only_the_selected_cpa_source(temp_data_dir):
+    discovery_only = db.create_cpa_channel(
+        name="Discovery",
+        base_url="https://cpa-discovery.example.test",
+        management_key="discovery-secret",
+    )
+    native = db.create_cpa_channel(
+        name="Native",
+        base_url="https://cpa-native.example.test",
+        management_key="native-secret",
+        cpamp_base_url="https://unused-cpamp.example.test",
+        cpamp_management_key="unused-cpamp-secret",
+        quota_source="native_queue",
+        confirm_exclusive=True,
+    )
+    cpamp = db.create_cpa_channel(
+        name="CPAMP",
+        base_url="https://unused-cpa.example.test",
+        management_key="unused-cpa-secret",
+        cpamp_base_url="https://cpamp.example.test",
+        cpamp_management_key="cpamp-secret",
+        quota_source="cpamp_snapshot",
+    )
+    collect_cpa = AsyncMock(return_value=True)
+    collect_cpamp = AsyncMock(return_value=True)
+
+    with (
+        patch("app.quota_sync.collect_cpa_channel", collect_cpa),
+        patch("app.quota_sync.collect_cpamp_channel", collect_cpamp),
+        patch("app.quota_sync.REQUEST_PACING_SECONDS", 0),
+    ):
+        await collect_due_quotas(owner_id="source-matrix")
+
+    assert [call.args[0].id for call in collect_cpa.await_args_list] == [
+        discovery_only.id,
+        native.id,
+    ]
+    assert [call.args[0].id for call in collect_cpamp.await_args_list] == [cpamp.id]
+
+
+@pytest.mark.asyncio
 async def test_scheduler_discards_result_after_credential_change(temp_data_dir):
     account = db.create_opencode_account(
         name="Changing",

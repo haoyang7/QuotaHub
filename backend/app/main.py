@@ -28,6 +28,11 @@ from .bootstrap import ensure_bootstrapped
 from .analytics import build_overview
 from .config import load_service_config, mask_cookie, mask_ollama_cookie, update_service_config
 from .cpa_quota import normalize_cpa_url
+from .cpa_queue import (
+    cpa_usage_queue_loop,
+    invalidate_cpa_account_cache,
+    wake_cpa_usage_queue,
+)
 from .opencode_usage import resolve_account_workspace_id
 from .quota_sync import quota_sync_loop, wake_quota_sync
 from .logging_config import configure_logging, get_logger, log_event, safe_exception_fields
@@ -36,6 +41,7 @@ from .schemas import (
     AdminLogin,
     CPAChannelCreate,
     CPAChannelUpdate,
+    CPAQuotaSourceUpdate,
     OllamaAccountCreate,
     OllamaAccountUpdate,
     OpenCodeAccountCreate,
@@ -49,6 +55,7 @@ FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 _sync_task: asyncio.Task[None] | None = None
 _quota_task: asyncio.Task[None] | None = None
+_cpa_queue_task: asyncio.Task[None] | None = None
 _usage_sync_lock = asyncio.Lock()
 USAGE_SYNC_LEASE_NAME = "usage-record-sync"
 logger = get_logger("main")
@@ -271,7 +278,7 @@ async def _usage_auto_sync_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _sync_task, _quota_task
+    global _sync_task, _quota_task, _cpa_queue_task
     configure_logging()
     ensure_bootstrapped()
     service = load_service_config()
@@ -279,10 +286,11 @@ async def lifespan(_app: FastAPI):
     if service.usage_sync.auto_sync:
         _sync_task = asyncio.create_task(_usage_auto_sync_loop())
     _quota_task = asyncio.create_task(quota_sync_loop())
+    _cpa_queue_task = asyncio.create_task(cpa_usage_queue_loop())
     try:
         yield
     finally:
-        for task in (_sync_task, _quota_task):
+        for task in (_sync_task, _quota_task, _cpa_queue_task):
             if task is not None:
                 task.cancel()
                 try:
@@ -305,8 +313,6 @@ cpa_router = APIRouter(
     tags=["admin-cpa"],
     dependencies=[Depends(require_admin)],
 )
-
-
 def _opencode_account_dict(row: db.OpenCodeAccountRow) -> dict[str, Any]:
     return {
         "id": row.id,
@@ -840,22 +846,44 @@ async def list_cpa_channels() -> list[dict[str, Any]]:
 
 @cpa_router.post("/channels", dependencies=[Depends(require_csrf)])
 async def create_cpa_channel(body: CPAChannelCreate) -> dict[str, Any]:
-    management_key = body.management_key.strip()
-    if not management_key:
-        raise HTTPException(status_code=400, detail="管理密钥不能为空")
+    cpa_url = ""
+    cpa_key = ""
+    if body.cpa_endpoint is not None:
+        cpa_key = body.cpa_endpoint.management_key.strip()
+        if not cpa_key:
+            raise HTTPException(status_code=400, detail="CPA 管理密钥不能为空")
+        try:
+            cpa_url = normalize_cpa_url(body.cpa_endpoint.url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="CPA URL 无效") from exc
+    cpamp_url: str | None = None
+    cpamp_key: str | None = None
+    if body.cpamp_endpoint is not None:
+        cpamp_key = body.cpamp_endpoint.admin_key.strip()
+        if not cpamp_key:
+            raise HTTPException(status_code=400, detail="CPAMP 管理密钥不能为空")
+        try:
+            cpamp_url = normalize_cpa_url(body.cpamp_endpoint.url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="CPAMP URL 无效") from exc
     try:
-        base_url = normalize_cpa_url(body.url)
+        row = db.create_cpa_channel(
+            name=body.name.strip() or "CPA",
+            base_url=cpa_url,
+            management_key=cpa_key,
+            cpamp_base_url=cpamp_url,
+            cpamp_management_key=cpamp_key,
+            quota_source=body.quota_source,
+            confirm_exclusive=body.confirm_exclusive,
+            enabled=body.enabled,
+            interval_sec=body.interval_sec,
+        )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="CPA URL 无效") from exc
-    row = db.create_cpa_channel(
-        name=body.name.strip() or "CPA",
-        base_url=base_url,
-        management_key=management_key,
-        enabled=body.enabled,
-        interval_sec=body.interval_sec,
-    )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if row.enabled:
         wake_quota_sync()
+        if row.queue_enabled:
+            wake_cpa_usage_queue()
     log_event(
         logger,
         logging.INFO,
@@ -863,7 +891,8 @@ async def create_cpa_channel(body: CPAChannelCreate) -> dict[str, Any]:
         provider="cpa",
         channel_id=row.id,
         enabled=row.enabled,
-        credential_changed=True,
+        quota_source=row.quota_source,
+        credential_changed=bool(cpa_key or cpamp_key),
     )
     return _admin_cpa_channel_dict(row.id)
 
@@ -883,19 +912,50 @@ async def update_cpa_channel(
     fields = body.model_dump(exclude_unset=True)
     if "name" in fields and fields["name"] is not None:
         fields["name"] = fields["name"].strip() or "CPA"
-    if "url" in fields:
-        raw_url = fields.pop("url")
-        if raw_url is not None:
-            try:
-                fields["base_url"] = normalize_cpa_url(raw_url)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail="CPA URL 无效") from exc
-    if "management_key" in fields and fields["management_key"] is not None:
-        management_key = fields["management_key"].strip()
-        if management_key:
-            fields["management_key"] = management_key
+    if "cpa_endpoint" in fields:
+        endpoint = fields.pop("cpa_endpoint")
+        if endpoint is None:
+            if previous.quota_source in {"none", "native_queue"}:
+                raise HTTPException(status_code=400, detail="当前额度来源依赖 CPA 端点")
+            fields["base_url"] = ""
+            fields["management_key"] = ""
         else:
-            fields.pop("management_key")
+            raw_url = endpoint.get("url")
+            if raw_url is not None:
+                try:
+                    fields["base_url"] = normalize_cpa_url(raw_url)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail="CPA URL 无效") from exc
+            management_key = (endpoint.get("management_key") or "").strip()
+            if management_key:
+                fields["management_key"] = management_key
+    if "cpamp_endpoint" in fields:
+        endpoint = fields.pop("cpamp_endpoint")
+        if endpoint is None:
+            if previous.quota_source == "cpamp_snapshot":
+                raise HTTPException(status_code=400, detail="当前额度来源依赖 CPAMP 端点")
+            fields["cpamp_base_url"] = None
+            fields["cpamp_management_key"] = None
+        else:
+            raw_url = endpoint.get("url")
+            if raw_url is not None:
+                try:
+                    fields["cpamp_base_url"] = normalize_cpa_url(raw_url)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail="CPAMP URL 无效") from exc
+            management_key = (endpoint.get("admin_key") or "").strip()
+            if management_key:
+                fields["cpamp_management_key"] = management_key
+    if (
+        previous.quota_source in {"none", "native_queue"}
+        and not fields.get("base_url", previous.base_url)
+    ):
+        raise HTTPException(status_code=400, detail="当前额度来源需要 CPA 端点")
+    if (
+        previous.quota_source == "cpamp_snapshot"
+        and not fields.get("cpamp_base_url", previous.cpamp_base_url)
+    ):
+        raise HTTPException(status_code=400, detail="当前额度来源需要 CPAMP 端点")
     for key in list(fields):
         if getattr(previous, key) == fields[key]:
             fields.pop(key)
@@ -905,14 +965,31 @@ async def update_cpa_channel(
     credential_changed = (
         row.base_url != previous.base_url
         or row.management_key != previous.management_key
+        or row.cpamp_base_url != previous.cpamp_base_url
+        or row.cpamp_management_key != previous.cpamp_management_key
+    )
+    cpa_endpoint_changed = (
+        row.base_url != previous.base_url
+        or row.management_key != previous.management_key
+    )
+    cpamp_endpoint_changed = (
+        row.cpamp_base_url != previous.cpamp_base_url
+        or row.cpamp_management_key != previous.cpamp_management_key
     )
     reenabled = not previous.enabled and row.enabled
     interval_changed = row.interval_sec != previous.interval_sec
-    if row.enabled and (credential_changed or reenabled):
+    selected_endpoint_changed = (
+        row.quota_source in {"none", "native_queue"} and cpa_endpoint_changed
+    ) or (row.quota_source == "cpamp_snapshot" and cpamp_endpoint_changed)
+    sync_scheduled = row.enabled and (selected_endpoint_changed or reenabled)
+    if sync_scheduled:
         db.mark_cpa_channel_due(channel_id)
+        invalidate_cpa_account_cache(channel_id)
         wake_quota_sync()
     elif row.enabled and interval_changed:
         wake_quota_sync()
+    if cpa_endpoint_changed or row.enabled != previous.enabled:
+        wake_cpa_usage_queue()
     if fields:
         log_event(
             logger,
@@ -921,16 +998,61 @@ async def update_cpa_channel(
             provider="cpa",
             channel_id=row.id,
             enabled=row.enabled,
+            quota_source=row.quota_source,
             credential_changed=credential_changed,
-            changed_fields=_safe_changed_fields(fields, {"management_key"}),
+            changed_fields=_safe_changed_fields(
+                fields, {"management_key", "cpamp_management_key"}
+            ),
         )
-    return _admin_cpa_channel_dict(row.id)
+    result = _admin_cpa_channel_dict(row.id)
+    result["sync_scheduled"] = sync_scheduled
+    return result
+
+
+@cpa_router.post("/channels/{channel_id}/quota-source", dependencies=[Depends(require_csrf)])
+async def update_cpa_quota_source(
+    channel_id: str, body: CPAQuotaSourceUpdate
+) -> dict[str, Any]:
+    previous = db.get_cpa_channel(channel_id)
+    if previous is None:
+        raise HTTPException(status_code=404, detail="CPA 渠道不存在")
+    try:
+        row = db.set_cpa_quota_source(
+            channel_id,
+            source=body.source,
+            confirm_exclusive=body.confirm_exclusive,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="CPA 渠道不存在")
+    source_changed = row.quota_source != previous.quota_source
+    sync_scheduled = row.enabled and source_changed
+    if sync_scheduled:
+        db.mark_cpa_channel_due(channel_id)
+        invalidate_cpa_account_cache(channel_id)
+        wake_quota_sync()
+    wake_cpa_usage_queue()
+    log_event(
+        logger,
+        logging.INFO,
+        "admin_cpa_quota_source_updated",
+        provider="cpa",
+        channel_id=channel_id,
+        quota_source=row.quota_source,
+        exclusive_confirmed=bool(row.exclusive_confirmed_at),
+    )
+    result = _admin_cpa_channel_dict(channel_id)
+    result["sync_scheduled"] = sync_scheduled
+    return result
 
 
 @cpa_router.delete("/channels/{channel_id}", dependencies=[Depends(require_csrf)])
 async def delete_cpa_channel(channel_id: str) -> dict[str, bool]:
     if not db.delete_cpa_channel(channel_id):
         raise HTTPException(status_code=404, detail="CPA 渠道不存在")
+    invalidate_cpa_account_cache(channel_id)
+    wake_cpa_usage_queue()
     log_event(
         logger,
         logging.INFO,

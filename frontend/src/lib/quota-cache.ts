@@ -5,7 +5,7 @@ import type {
   QuotaWindow,
 } from "@/lib/api";
 
-const CACHE_PREFIX = "quotahub:v2:cache:";
+const CACHE_PREFIX = "quotahub:v3:cache:";
 const OLLAMA_KEY = `${CACHE_PREFIX}ollama-quota`;
 const OPENCODE_KEY = `${CACHE_PREFIX}opencode-quota`;
 const DAILY_KEY = `${CACHE_PREFIX}daily-stats`;
@@ -15,6 +15,10 @@ const LEGACY_KEYS = [
   "quotahub:cache:opencode-quota",
   "quotahub:cache:daily-stats",
   "quotahub:cache:daily-model-stats",
+  "quotahub:v2:cache:ollama-quota",
+  "quotahub:v2:cache:opencode-quota",
+  "quotahub:v2:cache:daily-stats",
+  "quotahub:v2:cache:daily-model-stats",
 ];
 
 let legacyRemoved = false;

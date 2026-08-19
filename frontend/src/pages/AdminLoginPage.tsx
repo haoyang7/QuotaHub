@@ -48,28 +48,33 @@ export default function AdminLoginPage() {
           <CardTitle>管理员登录</CardTitle>
           <p className="text-sm text-muted-foreground">请输入服务端配置的管理令牌。</p>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="admin-token">管理令牌</Label>
-            <Input
-              id="admin-token"
-              type="password"
-              autoComplete="current-password"
-              value={token}
-              onChange={(event) => setToken(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && token) void submit();
-              }}
-            />
-          </div>
-          {error && <p className="text-sm text-rose-600">{error}</p>}
-          <Button className="w-full" disabled={!token || submitting} onClick={() => void submit()}>
-            {submitting ? "登录中…" : "登录"}
-          </Button>
-          <Button variant="outline" className="w-full" onClick={() => navigate("/")}>
-            返回公开页面
-          </Button>
-        </CardContent>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="admin-token">管理令牌</Label>
+              <Input
+                id="admin-token"
+                name="admin-token"
+                type="password"
+                autoComplete="current-password"
+                value={token}
+                onChange={(event) => setToken(event.target.value)}
+              />
+            </div>
+            {error && <p className="text-sm text-rose-600">{error}</p>}
+            <Button type="submit" className="w-full" disabled={!token || submitting}>
+              {submitting ? "登录中…" : "登录"}
+            </Button>
+            <Button type="button" variant="outline" className="w-full" onClick={() => navigate("/")}>
+              返回公开页面
+            </Button>
+          </CardContent>
+        </form>
       </Card>
     </div>
   );

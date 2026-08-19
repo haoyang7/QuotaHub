@@ -45,20 +45,47 @@ class OllamaAccountUpdate(BaseModel):
     enabled: bool | None = None
 
 
-class CPAChannelCreate(BaseModel):
-    name: str
+class CPAEndpointCreate(BaseModel):
     url: str
     management_key: str
+
+
+class CPAMPEndpointCreate(BaseModel):
+    url: str
+    admin_key: str
+
+
+class CPAEndpointUpdate(BaseModel):
+    url: str | None = None
+    management_key: str | None = None
+
+
+class CPAMPEndpointUpdate(BaseModel):
+    url: str | None = None
+    admin_key: str | None = None
+
+
+class CPAChannelCreate(BaseModel):
+    name: str
+    cpa_endpoint: CPAEndpointCreate | None = None
+    cpamp_endpoint: CPAMPEndpointCreate | None = None
+    quota_source: str = Field(default="none", pattern="^(none|native_queue|cpamp_snapshot)$")
+    confirm_exclusive: bool = False
     enabled: bool = True
     interval_sec: int = Field(default=1800, ge=300)
 
 
 class CPAChannelUpdate(BaseModel):
     name: str | None = None
-    url: str | None = None
-    management_key: str | None = None
+    cpa_endpoint: CPAEndpointUpdate | None = None
+    cpamp_endpoint: CPAMPEndpointUpdate | None = None
     enabled: bool | None = None
     interval_sec: int | None = Field(default=None, ge=300)
+
+
+class CPAQuotaSourceUpdate(BaseModel):
+    source: str = Field(pattern="^(none|native_queue|cpamp_snapshot)$")
+    confirm_exclusive: bool = False
 
 
 class RefreshSettingsResponse(BaseModel):

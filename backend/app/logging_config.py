@@ -11,6 +11,7 @@ from types import TracebackType
 from typing import Any, TextIO
 
 LOG_LEVEL_ENV = "QUOTAHUB_LOG_LEVEL"
+LOG_TIMEZONE_ENV = "QUOTAHUB_LOG_TIMEZONE"
 LOGGER_NAME = "quotahub"
 
 _LEVELS = {
@@ -28,6 +29,11 @@ _ALLOWED_EVENTS = {
     "admin_cpa_channel_created",
     "admin_cpa_channel_deleted",
     "admin_cpa_channel_updated",
+    "admin_cpa_quota_source_updated",
+    "admin_cpa_usage_queue_updated",
+    "admin_cpamp_channel_created",
+    "admin_cpamp_channel_deleted",
+    "admin_cpamp_channel_updated",
     "admin_login_failed",
     "admin_login_rate_limited",
     "admin_login_succeeded",
@@ -49,6 +55,28 @@ _ALLOWED_EVENTS = {
     "cpa_passive_snapshots_failed",
     "cpa_passive_snapshots_loaded",
     "cpa_passive_snapshots_unsupported",
+    "cpa_queue_authentication_failed",
+    "cpa_queue_account_mapping_empty",
+    "cpa_queue_account_refresh_failed",
+    "cpa_queue_batch_empty",
+    "cpa_queue_batch_processed",
+    "cpa_queue_channel_completed",
+    "cpa_queue_channel_failed",
+    "cpa_queue_config_disabled",
+    "cpa_queue_cycle_completed",
+    "cpa_queue_cycle_failed",
+    "cpa_queue_cycle_started",
+    "cpa_queue_event_processed",
+    "cpa_queue_event_failed",
+    "cpa_queue_lease_lost",
+    "cpa_queue_result_discarded",
+    "cpa_queue_unsupported",
+    "cpamp_channel_collection_completed",
+    "cpamp_channel_collection_failed",
+    "cpamp_snapshot_batch_failed",
+    "cpamp_snapshot_discarded",
+    "cpamp_snapshot_fallback",
+    "cpamp_snapshot_sync_started",
     "quota_cycle_completed",
     "quota_cycle_failed",
     "quota_cycle_idle",
@@ -83,8 +111,10 @@ _ALLOWED_FIELDS = {
     "account_id",
     "accounts_discovered",
     "accounts_remaining",
+    "batch_index",
     "changed_fields",
     "changed_sections",
+    "channel_count",
     "channel_id",
     "credential_changed",
     "cpa_jobs",
@@ -94,12 +124,15 @@ _ALLOWED_FIELDS = {
     "error_location",
     "error_type",
     "failure_count",
+    "event_count",
+    "exclusive_confirmed",
     "inserted",
     "interval_sec",
     "job_count",
     "lease_name",
     "ollama_jobs",
     "opencode_jobs",
+    "cpamp_jobs",
     "owner_id",
     "pages_fetched",
     "pid",
@@ -115,6 +148,7 @@ _ALLOWED_FIELDS = {
     "source_hmac",
     "success_count",
     "snapshot_count",
+    "snapshot_source",
     "version",
     "windows_count",
 }
@@ -122,10 +156,19 @@ _MAX_FIELD_LENGTH = 256
 
 
 class SafeEventFormatter(logging.Formatter):
+    def __init__(self, timezone_mode: str | None = None) -> None:
+        super().__init__()
+        self.timezone_mode = timezone_mode or configured_log_timezone()
+
     def format(self, record: logging.LogRecord) -> str:
-        timestamp = datetime.fromtimestamp(record.created, tz=UTC).isoformat(
-            timespec="milliseconds"
-        ).replace("+00:00", "Z")
+        if self.timezone_mode == "UTC":
+            timestamp = datetime.fromtimestamp(record.created, tz=UTC).isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z")
+        else:
+            timestamp = datetime.fromtimestamp(record.created).astimezone().isoformat(
+                timespec="milliseconds"
+            )
         source = f"{Path(record.pathname).name}:{record.lineno}"
         event = str(getattr(record, "event", "application_event"))
         fields = getattr(record, "event_fields", {})
@@ -152,6 +195,13 @@ def configured_log_level() -> int:
         raise ValueError(f"{LOG_LEVEL_ENV} must be one of: {allowed}") from exc
 
 
+def configured_log_timezone() -> str:
+    name = os.environ.get(LOG_TIMEZONE_ENV, "LOCAL").strip().upper() or "LOCAL"
+    if name not in {"LOCAL", "UTC"}:
+        raise ValueError(f"{LOG_TIMEZONE_ENV} must be one of: LOCAL, UTC")
+    return name
+
+
 def configure_logging(*, stream: TextIO | None = None) -> logging.Logger:
     access_logger = logging.getLogger("uvicorn.access")
     access_logger.handlers.clear()
@@ -169,7 +219,7 @@ def configure_logging(*, stream: TextIO | None = None) -> logging.Logger:
 
     handler = logging.StreamHandler(stream or sys.stdout)
     handler.setLevel(logger.level)
-    handler.setFormatter(SafeEventFormatter())
+    handler.setFormatter(SafeEventFormatter(configured_log_timezone()))
     handler._quotahub_safe_handler = True  # type: ignore[attr-defined]
     logger.addHandler(handler)
     return logger

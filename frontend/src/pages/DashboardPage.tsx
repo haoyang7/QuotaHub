@@ -176,6 +176,15 @@ export default function DashboardPage() {
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <h3 className="font-medium text-slate-800">{channel.name}</h3>
+                  <p className="text-xs text-muted-foreground">
+                    {channel.quota_source === "native_queue"
+                      ? "原生 CPA HTTP usage"
+                      : channel.quota_source === "cpamp_snapshot"
+                        ? channel.snapshot_source === "header_snapshots"
+                          ? "CPAMP Header Snapshot 兼容模式"
+                          : "CPAMP 只读快照"
+                        : "仅发现账号"}
+                  </p>
                 </div>
                 <div className="flex items-center gap-2">
                   {channel.stale && <Badge variant="warning">渠道缓存已陈旧</Badge>}
@@ -191,7 +200,13 @@ export default function DashboardPage() {
               )}
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                 {channel.accounts.map((account) => (
-                  <CPAAccountCard key={account.public_id} account={account} />
+                  <CPAAccountCard
+                    key={account.public_id}
+                    account={account}
+                    providerLabel={
+                      channel.quota_source === "cpamp_snapshot" ? "CPAMP 只读快照" : undefined
+                    }
+                  />
                 ))}
               </div>
             </div>

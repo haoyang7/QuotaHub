@@ -24,6 +24,7 @@ docker run -d --name quotahub \\
   -e QUOTAHUB_ADMIN_TOKEN='<必填：至少 32 字符>' \\
   -e QUOTAHUB_ENCRYPTION_KEY='<必填：Fernet 密钥>' \\
   -e QUOTAHUB_COOKIE_SECURE=false \\
+  -e QUOTAHUB_LOG_TIMEZONE=LOCAL \\
   ${image}
 \`\`\`
 
@@ -43,6 +44,7 @@ cd quotahub-${version}
 export QUOTAHUB_ADMIN_TOKEN='<必填：至少 32 字符>'
 export QUOTAHUB_ENCRYPTION_KEY='<必填：Fernet 密钥>'
 export QUOTAHUB_COOKIE_SECURE=false
+export QUOTAHUB_LOG_TIMEZONE=LOCAL
 ./scripts/start.sh
 \`\`\`
 
@@ -54,6 +56,7 @@ cd quotahub-${version}
 \$env:QUOTAHUB_ADMIN_TOKEN='<必填：至少 32 字符>'
 \$env:QUOTAHUB_ENCRYPTION_KEY='<必填：Fernet 密钥>'
 \$env:QUOTAHUB_COOKIE_SECURE='false'
+\$env:QUOTAHUB_LOG_TIMEZONE='LOCAL'
 scripts\\start.bat
 \`\`\`
 
@@ -72,6 +75,7 @@ cd frontend && corepack enable && pnpm install --frozen-lockfile && pnpm build &
 export QUOTAHUB_ADMIN_TOKEN='<必填：至少 32 字符>'
 export QUOTAHUB_ENCRYPTION_KEY='<必填：Fernet 密钥>'
 export QUOTAHUB_COOKIE_SECURE=false
+export QUOTAHUB_LOG_TIMEZONE=LOCAL
 ./scripts/start.sh          # Linux / macOS
 \`\`\`
 
@@ -79,9 +83,9 @@ export QUOTAHUB_COOKIE_SECURE=false
 
 ---
 
-生产 HTTPS 部署请将 QUOTAHUB_COOKIE_SECURE 设为 true。Fernet 密钥必须长期稳定；升级前停止全部旧实例并备份 SQLite，完成 0.3.0 迁移后再扩容，禁止新旧版本同时运行。
+生产 HTTPS 部署请将 QUOTAHUB_COOKIE_SECURE 设为 true。Fernet 密钥必须长期稳定；升级前停止全部旧实例并备份 SQLite，完成 ${version#v} 迁移后再扩容，禁止新旧版本同时运行。
 
-Windows 源码运行请按上方 UV 包示例设置三个必填环境变量。
+Windows 源码运行请按上方 UV 包示例设置两个必填 Secret，并按部署环境设置 Cookie 与日志时区选项。
 
 ## 校验
 

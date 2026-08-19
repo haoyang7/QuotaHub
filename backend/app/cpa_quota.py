@@ -16,7 +16,6 @@ from .secrets import keyed_fingerprint
 from .version import APP_VERSION
 
 TIMEOUT = httpx.Timeout(20.0, connect=10.0)
-USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 USER_AGENT = f"QuotaHub/{APP_VERSION}"
 
 
@@ -28,14 +27,6 @@ class CPAChannelAuthenticationError(CPAError):
     pass
 
 
-class CPAAccountAuthenticationError(CPAError):
-    pass
-
-
-class CPAPassiveSnapshotsUnsupported(CPAError):
-    pass
-
-
 @dataclass
 class CPAAuthAccount:
     auth_index: str
@@ -43,28 +34,10 @@ class CPAAuthAccount:
     account_key_hash: str
     account_display: str
     plan: str
+    locator_hash: str = ""
+    subject_hash: str = ""
     legacy_account_key_hash: str | None = None
     previous_account_key_hash: str | None = None
-
-
-@dataclass
-class CPAAccountQuota:
-    plan: str
-    windows: list[dict[str, Any]]
-
-    def __len__(self) -> int:
-        return len(self.windows)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        return self.windows[index]
-
-
-@dataclass
-class CPAHeaderSnapshotQuota:
-    plan: str
-    windows: list[dict[str, Any]]
-    observed_at: str
-
 
 def normalize_cpa_url(value: str) -> str:
     raw = value.strip()
@@ -216,6 +189,8 @@ def _account_from_auth_file(entry: dict[str, Any]) -> CPAAuthAccount | None:
         account_key_hash=keyed_fingerprint("cpa-account-v2", identity_material),
         account_display=display,
         plan=_resolve_cpa_plan(entry),
+        locator_hash=keyed_fingerprint("cpa-locator-v1", auth_index.strip()),
+        subject_hash=keyed_fingerprint("cpa-canonical-subject-v1", subject),
         legacy_account_key_hash=hashlib.sha256(auth_index.encode("utf-8")).hexdigest(),
         previous_account_key_hash=keyed_fingerprint("cpa-account", auth_index),
     )
@@ -438,93 +413,6 @@ def parse_cpa_usage_payload(payload: Any, *, now: datetime | None = None) -> lis
     return windows
 
 
-def parse_cpa_account_quota(
-    payload: Any, *, now: datetime | None = None
-) -> CPAAccountQuota:
-    decoded = payload
-    if isinstance(decoded, str):
-        try:
-            decoded = json.loads(decoded)
-        except json.JSONDecodeError as exc:
-            raise CPAError("CPA 额度响应不是有效 JSON") from exc
-    container = _quota_container(decoded)
-    if container is None:
-        raise CPAError("CPA 额度响应缺少 quota 窗口")
-    plan_candidates = [
-        _first_text(container, ("plan_type", "chatgpt_plan_type", "plan")),
-        _first_text(decoded, ("plan_type", "chatgpt_plan_type", "plan"))
-        if isinstance(decoded, dict)
-        else "",
-    ]
-    plan = "未知套餐"
-    for candidate in plan_candidates:
-        mapped = map_cpa_plan(candidate)
-        if mapped != "未知套餐":
-            plan = mapped
-            break
-    return CPAAccountQuota(
-        plan=plan,
-        windows=parse_cpa_usage_payload(decoded, now=now),
-    )
-
-
-def _normalized_snapshot_identity(value: Any) -> str:
-    if isinstance(value, bool) or value is None:
-        return ""
-    if not isinstance(value, (str, int, float)):
-        return ""
-    return str(value).strip().casefold()
-
-
-def match_cpa_header_snapshot(
-    account: CPAAuthAccount, items: list[Any]
-) -> dict[str, Any] | None:
-    file_name = _normalized_snapshot_identity(account.auth_file_name)
-    auth_index = _normalized_snapshot_identity(account.auth_index)
-    if not file_name or not auth_index:
-        return None
-
-    newest: dict[str, Any] | None = None
-    newest_timestamp = float("-inf")
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if _normalized_snapshot_identity(item.get("auth_file_snapshot")) != file_name:
-            continue
-        if _normalized_snapshot_identity(item.get("auth_index")) != auth_index:
-            continue
-        timestamp = _as_number(item.get("timestamp_ms"))
-        if timestamp is None or timestamp < newest_timestamp:
-            continue
-        newest = item
-        newest_timestamp = timestamp
-    return newest
-
-
-def parse_cpa_header_snapshot(
-    snapshot: Any, *, now: datetime | None = None
-) -> CPAHeaderSnapshotQuota:
-    if not isinstance(snapshot, dict):
-        raise CPAError("CPA Header Snapshot 格式无效")
-    observed = _parse_timestamp(snapshot.get("timestamp_ms"))
-    if observed is None:
-        raise CPAError("CPA Header Snapshot 缺少有效观测时间")
-    metadata = snapshot.get("response_metadata")
-    quota = metadata.get("quota") if isinstance(metadata, dict) else None
-    if not isinstance(quota, dict):
-        raise CPAError("CPA Header Snapshot 缺少 quota")
-
-    windows = parse_cpa_usage_payload({"quota": quota}, now=observed)
-    plan = map_cpa_plan(snapshot.get("header_quota_plan_type"))
-    if plan == "未知套餐":
-        plan = map_cpa_plan(quota.get("plan_type"))
-    return CPAHeaderSnapshotQuota(
-        plan=plan,
-        windows=windows,
-        observed_at=observed.isoformat().replace("+00:00", "Z"),
-    )
-
-
 async def discover_cpa_accounts(
     channel: CPAChannelRow, client: httpx.AsyncClient | None = None
 ) -> list[CPAAuthAccount]:
@@ -544,83 +432,6 @@ async def discover_cpa_accounts(
         except (json.JSONDecodeError, ValueError) as exc:
             raise CPAError("CPA 账号列表响应不是有效 JSON") from exc
         return parse_auth_files(payload)
-    finally:
-        if owns_client:
-            await http.aclose()
-
-
-async def fetch_cpa_header_snapshots(
-    channel: CPAChannelRow, client: httpx.AsyncClient | None = None
-) -> list[dict[str, Any]]:
-    owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False)
-    try:
-        response = await http.get(
-            _management_url(
-                channel.base_url, "/v0/management/monitoring/header-snapshots"
-            ),
-            headers=_management_headers(channel.management_key),
-            params={"days": 30, "limit": 1000},
-        )
-        if response.status_code in (401, 403):
-            raise CPAChannelAuthenticationError("CPA 管理认证失败")
-        if response.status_code in (404, 405):
-            raise CPAPassiveSnapshotsUnsupported("CPA 不支持 Header Snapshot")
-        if response.status_code < 200 or response.status_code >= 300:
-            raise CPAError(f"CPA Header Snapshot 返回 HTTP {response.status_code}")
-        try:
-            payload = response.json()
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise CPAError("CPA Header Snapshot 响应不是有效 JSON") from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
-            raise CPAError("CPA Header Snapshot 响应缺少 items")
-        return [item for item in payload["items"] if isinstance(item, dict)]
-    finally:
-        if owns_client:
-            await http.aclose()
-
-
-async def fetch_cpa_account_quota(
-    channel: CPAChannelRow,
-    account: CPAAuthAccount,
-    client: httpx.AsyncClient | None = None,
-) -> CPAAccountQuota:
-    owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False)
-    try:
-        response = await http.post(
-            _management_url(channel.base_url, "/v0/management/api-call"),
-            headers={**_management_headers(channel.management_key), "Content-Type": "application/json"},
-            json={
-                "auth_index": account.auth_index,
-                "method": "GET",
-                "url": USAGE_URL,
-                "header": {
-                    "Authorization": "Bearer $TOKEN$",
-                    "Accept": "application/json",
-                    "User-Agent": USER_AGENT,
-                },
-            },
-        )
-        if response.status_code in (401, 403):
-            raise CPAChannelAuthenticationError("CPA 管理认证失败")
-        if response.status_code < 200 or response.status_code >= 300:
-            raise CPAError(f"CPA 代理调用返回 HTTP {response.status_code}")
-        try:
-            wrapper = response.json()
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise CPAError("CPA 代理调用响应不是有效 JSON") from exc
-        if not isinstance(wrapper, dict):
-            raise CPAError("CPA 代理调用响应格式无效")
-        try:
-            status_code = int(wrapper.get("status_code") or 0)
-        except (TypeError, ValueError) as exc:
-            raise CPAError("CPA 代理调用缺少有效状态码") from exc
-        if status_code in (401, 403):
-            raise CPAAccountAuthenticationError("CPA 账号认证失败")
-        if status_code < 200 or status_code >= 300:
-            raise CPAError(f"CPA 上游额度返回 HTTP {status_code or '未知'}")
-        return parse_cpa_account_quota(wrapper.get("body"))
     finally:
         if owns_client:
             await http.aclose()

@@ -256,14 +256,20 @@ export function OpenGoAccountCard({
   );
 }
 
-export function CPAAccountCard({ account }: { account: CPAQuotaAccount }) {
+export function CPAAccountCard({
+  account,
+  providerLabel = "CLIProxyAPI",
+}: {
+  account: CPAQuotaAccount;
+  providerLabel?: string;
+}) {
   return (
     <Card>
       <CardHeader className="pb-4">
         <div className="flex items-start justify-between gap-3">
           <div>
             <CardTitle className="text-base">{account.account}</CardTitle>
-            <CardDescription className="mt-1">CLIProxyAPI</CardDescription>
+            <CardDescription className="mt-1">{providerLabel}</CardDescription>
           </div>
           <div className="flex items-center gap-2">
             <Badge variant="default">{account.plan}</Badge>

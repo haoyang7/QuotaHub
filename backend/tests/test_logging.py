@@ -19,7 +19,8 @@ from app.logging_config import (
     safe_exception_fields,
 )
 from app.main import app, run
-from app.cpa_quota import CPAAuthAccount, CPAError
+from app.cpa_quota import CPAAuthAccount
+from app.cpa_queue import collect_cpa_usage_queue_channel
 from app.quota_sync import collect_cpa_channel, quota_sync_loop
 from app.scheduler import SchedulerLease
 
@@ -46,7 +47,8 @@ def test_safe_event_format_and_exception_message_redaction(monkeypatch):
 
     output = stream.getvalue()
     assert re.search(
-        r"^\[\d{4}-\d{2}-\d{2}T.*Z\] \[ERROR\] \[test_logging.py:\d+\] quota_job_failed ",
+        r"^\[\d{4}-\d{2}-\d{2}T.*[+-]\d{2}:\d{2}\] "
+        r"\[ERROR\] \[test_logging.py:\d+\] quota_job_failed ",
         output,
     )
     assert 'error_code="controlled_error"' in output
@@ -66,6 +68,18 @@ def test_safe_event_format_and_exception_message_redaction(monkeypatch):
 def test_invalid_log_level_is_rejected(monkeypatch):
     monkeypatch.setenv("QUOTAHUB_LOG_LEVEL", "TRACE")
     with pytest.raises(ValueError, match="QUOTAHUB_LOG_LEVEL"):
+        configure_logging(stream=io.StringIO())
+
+
+def test_log_timezone_supports_utc_and_rejects_invalid_value(monkeypatch):
+    stream = io.StringIO()
+    monkeypatch.setenv("QUOTAHUB_LOG_TIMEZONE", "UTC")
+    configure_logging(stream=stream)
+    log_event(get_logger("timezone"), logging.INFO, "application_started")
+    assert re.search(r"^\[\d{4}-\d{2}-\d{2}T.*Z\]", stream.getvalue())
+
+    monkeypatch.setenv("QUOTAHUB_LOG_TIMEZONE", "Mars/Olympus")
+    with pytest.raises(ValueError, match="QUOTAHUB_LOG_TIMEZONE"):
         configure_logging(stream=io.StringIO())
 
 
@@ -170,7 +184,7 @@ async def test_cpa_collection_logs_never_include_channel_secrets(temp_data_dir):
 
 
 @pytest.mark.asyncio
-async def test_cpa_passive_and_active_fallback_logs_redact_snapshot_identity(
+async def test_cpa_queue_logs_redact_raw_event_and_snapshot_identity(
     temp_data_dir,
 ):
     stream = io.StringIO()
@@ -187,32 +201,46 @@ async def test_cpa_passive_and_active_fallback_logs_redact_snapshot_identity(
         account_display="e***@example.com",
         plan="Plus",
     )
+    channel = db.configure_cpa_usage_queue(
+        channel.id, enabled=True, confirm_exclusive=True
+    )
+    assert channel is not None
+
+    class Lease:
+        def is_valid(self) -> bool:
+            return True
+
+    raw_event = {
+        "provider": "codex",
+        "auth_index": account.auth_index,
+        "timestamp": "2026-08-15T01:00:00Z",
+        "api_key": "api-key-secret-sentinel",
+        "client_ip": "192.0.2.10",
+        "user_agent": "user-agent-secret-sentinel",
+        "fail": {"body": "exception-secret-sentinel"},
+        "response_headers": {
+            "X-Codex-Primary-Used-Percent": ["25"],
+            "X-Codex-Primary-Window-Minutes": ["300"],
+        },
+    }
     with (
         patch(
-            "app.quota_sync.discover_cpa_accounts",
-            AsyncMock(return_value=[account]),
+            "app.cpa_queue._load_accounts",
+            AsyncMock(return_value={account.auth_index: account}),
         ),
         patch(
-            "app.quota_sync.fetch_cpa_header_snapshots",
-            AsyncMock(
-                return_value=[
-                    {
-                        "timestamp_ms": 1,
-                        "auth_file_snapshot": account.auth_file_name,
-                        "auth_index": account.auth_index,
-                        "response_metadata": {
-                            "quota": {"private-body-sentinel": True}
-                        },
-                    }
-                ]
-            ),
+            "app.cpa_queue._usage_statistics_enabled",
+            AsyncMock(return_value=True),
         ),
         patch(
-            "app.quota_sync.fetch_cpa_account_quota",
-            AsyncMock(side_effect=CPAError("exception-secret-sentinel")),
+            "app.cpa_queue._pop_usage_queue",
+            AsyncMock(return_value=[raw_event]),
         ),
     ):
-        assert await collect_cpa_channel(channel, run_id="safe-run") is True
+        processed, discarded = await collect_cpa_usage_queue_channel(
+            channel, lease=Lease(), run_id="safe-run"
+        )
+    assert (processed, discarded) == (1, 0)
 
     output = stream.getvalue()
     for secret in (
@@ -222,12 +250,13 @@ async def test_cpa_passive_and_active_fallback_logs_redact_snapshot_identity(
         "auth-index-secret-sentinel",
         "file-secret-sentinel",
         "e***@example.com",
-        "private-body-sentinel",
+        "api-key-secret-sentinel",
+        "192.0.2.10",
+        "user-agent-secret-sentinel",
         "exception-secret-sentinel",
     ):
         assert secret not in output
-    assert "cpa_passive_snapshots_loaded" in output
-    assert "quota_job_failed" in output
+    assert "cpa_queue_event_processed" in output
 
 
 def test_console_entrypoint_bootstraps_an_empty_database(

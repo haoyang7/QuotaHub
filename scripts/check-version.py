@@ -53,7 +53,7 @@ def normalized_tag(value: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="校验 QuotaHub 发布版本声明")
-    parser.add_argument("tag", nargs="?", help="可选 Git tag，例如 v0.3.0")
+    parser.add_argument("tag", nargs="?", help="可选 Git tag，例如 v0.3.1")
     args = parser.parse_args()
 
     versions = {

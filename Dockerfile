@@ -15,6 +15,13 @@ RUN pnpm build
 FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim AS runtime
 WORKDIR /app/backend
 
+# The published UV base can lag Debian security updates by a few days. Apply
+# the available security upgrades before copying the application so the final
+# image is scanned against current Trixie packages without adding build tools.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONUNBUFFERED=1 \
     QUOTAHUB_DATA=/data \
     QUOTAHUB_LISTEN_HOST=0.0.0.0 \

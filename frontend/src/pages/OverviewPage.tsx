@@ -275,29 +275,31 @@ export default function OverviewPage() {
         </div>
       )}
 
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">CPA / CLIProxyAPI 概览</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {cpaSummary.accountCount === 0 ? (
-            <p className="py-4 text-center text-sm text-muted-foreground">暂无 CPA 账号快照</p>
-          ) : (
-            <div className="flex flex-wrap items-center gap-3 text-sm">
-              <Badge variant="default">{cpaChannels.length} 个渠道</Badge>
-              <Badge variant="success">
-                {cpaSummary.successCount}/{cpaSummary.accountCount} 个账号正常
-              </Badge>
-              {cpaSummary.staleCount > 0 && (
-                <Badge variant="warning">{cpaSummary.staleCount} 个缓存已陈旧</Badge>
-              )}
-              {cpaSummary.plans.map(([plan, count]) => (
-                <Badge key={plan} variant="default">{plan} · {count}</Badge>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base">CPA / CLIProxyAPI 概览</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {cpaSummary.accountCount === 0 ? (
+              <p className="py-4 text-center text-sm text-muted-foreground">暂无 CPA 账号快照</p>
+            ) : (
+              <div className="flex flex-wrap items-center gap-3 text-sm">
+                <Badge variant="default">{cpaChannels.length} 个渠道</Badge>
+                <Badge variant="success">
+                  {cpaSummary.successCount}/{cpaSummary.accountCount} 个账号正常
+                </Badge>
+                {cpaSummary.staleCount > 0 && (
+                  <Badge variant="warning">{cpaSummary.staleCount} 个缓存已陈旧</Badge>
+                )}
+                {cpaSummary.plans.map(([plan, count]) => (
+                  <Badge key={plan} variant="default">{plan} · {count}</Badge>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
 
       <Card>
         <CardHeader className="pb-3">

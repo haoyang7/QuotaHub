@@ -102,12 +102,13 @@ def build_ollama_cookie_header(session_cookie: str) -> str:
 
 def _extract_cloud_usage_block(html: str) -> str:
     match = re.search(
-        r"<span>Cloud usage</span>(.*?)</div>\s*<script>",
+        r"<span\b[^>]*>\s*Cloud usage\s*</span>"
+        r"(.*?)(?:</section>|</div>)\s*<script\b[^>]*>",
         html,
         re.DOTALL | re.IGNORECASE,
     )
     if not match:
-        raise ValueError("页面中未找到 Cloud usage 区块（可能未登录或页面结构已变更）")
+        raise ValueError("页面中未找到 Cloud usage 区块（页面结构可能已变更）")
     return match.group(1)
 
 

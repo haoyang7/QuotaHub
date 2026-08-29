@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Database, Network, Pencil, Plus, Trash2, Waves } from "lucide-react";
+import { Database, Network, Pencil, Plus, RefreshCw, Trash2, Waves } from "lucide-react";
 import { QuotaWindowRow } from "@/components/quota/QuotaCards";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -12,11 +12,14 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   api,
   type AdminCPAChannel,
+  type AdminQuotaAccount,
   type CPAQuotaSource,
   type CPAQuotaAccount,
   type OllamaAccount,
+  type OllamaQuotaAccount,
   type OpenCodeAccount,
 } from "@/lib/api";
+import { showToast } from "@/lib/toast";
 
 type Tab = "opencode" | "ollama" | "cpa";
 type ChannelSavePayload = {
@@ -491,35 +494,54 @@ function AccountSnapshots({
   }
   return (
     <div className="grid gap-2 md:grid-cols-2">
-      {accounts.map((account) => (
-        <div
-          key={account.public_id}
-          className="space-y-3 rounded-xl border border-slate-200 p-3 text-sm"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="font-medium">{account.account}</span>
-            <div className="flex items-center gap-2">
-              <Badge variant="default">{account.plan}</Badge>
-              {account.stale && <Badge variant="warning">陈旧</Badge>}
+      {accounts.map((account) => {
+        const observedAt = account.observed_at || account.updated_at;
+        return (
+          <div
+            key={account.public_id}
+            className="rounded-xl border border-slate-200 p-3 text-sm"
+          >
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="min-w-0 space-y-2">
+                <p className="text-xs font-medium text-muted-foreground">凭证 / 账号</p>
+                <p className="truncate font-medium" title={account.account}>
+                  {account.account}
+                </p>
+                {account.auth_file_masked && (
+                  <p className="truncate text-xs text-muted-foreground" title={account.auth_file_masked}>
+                    凭证：<span className="font-mono">{account.auth_file_masked}</span>
+                  </p>
+                )}
+              </div>
+              <div className="min-w-0 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-xs font-medium text-muted-foreground">额度信息</p>
+                  <div className="flex items-center gap-2">
+                    <Badge variant="default">{account.plan}</Badge>
+                    {account.stale && <Badge variant="warning">陈旧</Badge>}
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {account.success ? "额度缓存正常" : account.error || "等待首次额度事件"}
+                </p>
+                {account.windows.length > 0 && (
+                  <div className="space-y-3 border-t border-slate-100 pt-3">
+                    {account.windows.map((window) => (
+                      <QuotaWindowRow key={window.label} window={window} />
+                    ))}
+                  </div>
+                )}
+                {observedAt && (
+                  <p className="text-[11px] text-muted-foreground">
+                    {account.observed_at ? "额度观测于" : "最近成功于"}{" "}
+                    {new Date(observedAt).toLocaleString("zh-CN")}
+                  </p>
+                )}
+              </div>
             </div>
           </div>
-          <p className="text-xs text-muted-foreground">
-            {account.success ? "额度缓存正常" : account.error || "等待首次额度事件"}
-          </p>
-          {account.windows.length > 0 && (
-            <div className="space-y-3 border-t border-slate-100 pt-3">
-              {account.windows.map((window) => (
-                <QuotaWindowRow key={window.label} window={window} />
-              ))}
-            </div>
-          )}
-          {account.updated_at && (
-            <p className="text-[11px] text-muted-foreground">
-              最近成功于 {new Date(account.updated_at).toLocaleString("zh-CN")}
-            </p>
-          )}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -551,6 +573,9 @@ export default function AccountsPage() {
   const [pageError, setPageError] = useState("");
   const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
   const pendingRef = useRef(new Set<string>());
+  const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
+  const [opencodeQuota, setOpencodeQuota] = useState<Record<string, AdminQuotaAccount>>({});
+  const [ollamaQuota, setOllamaQuota] = useState<Record<string, OllamaQuotaAccount>>({});
 
   const load = useCallback(async () => {
     const [cfg, cpa] = await Promise.all([api.config(), api.listCPAChannels()]);
@@ -585,6 +610,33 @@ export default function AccountsPage() {
     } finally {
       pendingRef.current.delete(key);
       setPending((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+    }
+  }, []);
+
+  const runRefresh = useCallback(async (
+    key: string,
+    operation: () => Promise<void>
+  ): Promise<void> => {
+    if (pendingRef.current.has(key)) return;
+    pendingRef.current.add(key);
+    setPending((current) => ({ ...current, [key]: true }));
+    setRefreshing((current) => ({ ...current, [key]: true }));
+    try {
+      await operation();
+    } catch (error) {
+      showToast((error as Error).message, "error");
+    } finally {
+      pendingRef.current.delete(key);
+      setPending((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      setRefreshing((current) => {
         const next = { ...current };
         delete next[key];
         return next;
@@ -754,6 +806,8 @@ export default function AccountsPage() {
           <div className="grid gap-3">
             {openCodeAccounts.map((account) => {
               const busy = Boolean(pending[`opencode:${account.id}`]);
+              const isRefreshing = Boolean(refreshing[`opencode:${account.id}`]);
+              const quota = opencodeQuota[account.id];
               return (
                 <Card key={account.id}>
                   <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
@@ -765,6 +819,19 @@ export default function AccountsPage() {
                           {account.resolved_workspace_id || account.workspace_id}
                         </p>
                         <p className="text-xs text-muted-foreground">{account.auth_cookie_masked}</p>
+                        {quota && (
+                          <p
+                            className={
+                              quota.success
+                                ? "text-xs text-muted-foreground"
+                                : "text-xs text-rose-600"
+                            }
+                          >
+                            {quota.success
+                              ? `额度更新于 ${new Date(quota.updated_at).toLocaleString("zh-CN")}`
+                              : quota.error || "额度采集失败"}
+                          </p>
+                        )}
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
@@ -781,6 +848,25 @@ export default function AccountsPage() {
                       <Badge variant={account.enabled ? "success" : "warning"}>
                         {account.enabled ? "启用" : "停用"}
                       </Badge>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={busy}
+                        aria-label={`刷新 OpenCode Go 账号 ${account.name}`}
+                        title={`刷新 OpenCode Go 账号 ${account.name}`}
+                        onClick={() =>
+                          void runRefresh(`opencode:${account.id}`, async () => {
+                            const refreshed = await api.refreshOpenCodeAccount(account.id);
+                            setOpencodeQuota((prev) => ({ ...prev, [account.id]: refreshed }));
+                          })
+                        }
+                      >
+                        <RefreshCw
+                          className={isRefreshing ? "h-4 w-4 animate-spin" : "h-4 w-4"}
+                          aria-hidden="true"
+                        />
+                        刷新
+                      </Button>
                       <Button
                         variant="outline"
                         size="sm"
@@ -835,12 +921,27 @@ export default function AccountsPage() {
           <div className="grid gap-3">
             {ollamaAccounts.map((account) => {
               const busy = Boolean(pending[`ollama:${account.id}`]);
+              const isRefreshing = Boolean(refreshing[`ollama:${account.id}`]);
+              const quota = ollamaQuota[account.id];
               return (
                 <Card key={account.id}>
                   <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
                     <div>
                       <p className="font-medium">{account.name}</p>
                       <p className="text-xs text-muted-foreground">{account.session_cookie_masked}</p>
+                      {quota && (
+                        <p
+                          className={
+                            quota.success
+                              ? "text-xs text-muted-foreground"
+                              : "text-xs text-rose-600"
+                          }
+                        >
+                          {quota.success
+                            ? `额度更新于 ${new Date(quota.updated_at).toLocaleString("zh-CN")}`
+                            : quota.error || "额度采集失败"}
+                        </p>
+                      )}
                     </div>
                     <div className="flex items-center gap-2">
                       <Switch
@@ -856,6 +957,25 @@ export default function AccountsPage() {
                       <Badge variant={account.enabled ? "success" : "warning"}>
                         {account.enabled ? "启用" : "停用"}
                       </Badge>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={busy}
+                        aria-label={`刷新 Ollama 账号 ${account.name}`}
+                        title={`刷新 Ollama 账号 ${account.name}`}
+                        onClick={() =>
+                          void runRefresh(`ollama:${account.id}`, async () => {
+                            const refreshed = await api.refreshOllamaAccount(account.id);
+                            setOllamaQuota((prev) => ({ ...prev, [account.id]: refreshed }));
+                          })
+                        }
+                      >
+                        <RefreshCw
+                          className={isRefreshing ? "h-4 w-4 animate-spin" : "h-4 w-4"}
+                          aria-hidden="true"
+                        />
+                        刷新
+                      </Button>
                       <Button
                         variant="outline"
                         size="sm"
@@ -965,6 +1085,7 @@ export default function AccountsPage() {
           <div className="grid gap-4">
             {cpaChannels.map((channel) => {
               const busy = Boolean(pending[`cpa:${channel.id}`]);
+              const isRefreshing = Boolean(refreshing[`cpa:${channel.id}`]);
               return (
                 <Card key={channel.id}>
                   <CardHeader className="pb-3">
@@ -1013,6 +1134,27 @@ export default function AccountsPage() {
                               ? "CPAMP 快照"
                               : "仅发现账号"}
                         </Badge>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={busy}
+                          aria-label={`刷新 CPA 渠道 ${channel.name}`}
+                          title={`刷新 CPA 渠道 ${channel.name}`}
+                          onClick={() =>
+                            void runRefresh(`cpa:${channel.id}`, async () => {
+                              const refreshed = await api.refreshCpaChannel(channel.id);
+                              setCpaChannels((prev) =>
+                                prev.map((c) => (c.id === refreshed.id ? refreshed : c))
+                              );
+                            })
+                          }
+                        >
+                          <RefreshCw
+                            className={isRefreshing ? "h-4 w-4 animate-spin" : "h-4 w-4"}
+                            aria-hidden="true"
+                          />
+                          刷新
+                        </Button>
                         <Button
                           variant="outline"
                           size="sm"
@@ -1079,6 +1221,8 @@ export default function AccountsPage() {
                             <Badge variant="default">
                               {channel.snapshot_source === "header_snapshots"
                                 ? "Header Snapshot 兼容模式"
+                                : channel.snapshot_source === "auth_files"
+                                  ? "实时额度观测"
                                 : "Quota Snapshot"}
                             </Badge>
                           )}

@@ -11,14 +11,17 @@ from app import db
 from app.cpamp_quota import (
     CPAMPAccount,
     CPAMPAuthenticationError,
+    CPAMPError,
     CPAMPQueryUnsupported,
     discover_cpamp_accounts,
     fetch_cpamp_header_snapshots,
     parse_cpamp_auth_files,
     parse_cpamp_header_items,
     parse_cpamp_query_items,
+    parse_cpamp_signal_snapshot,
     query_cpamp_snapshots_batch,
 )
+from app.cpa_quota import auth_tag_from_locator, mask_auth_file_name
 from app.quota_sync import collect_cpamp_channel
 
 
@@ -478,6 +481,60 @@ async def test_cpamp_protocol_discovers_and_queries_read_only_snapshots(temp_dat
 
 
 @pytest.mark.asyncio
+async def test_cpamp_auth_files_protocol_flows_through_collector_and_storage(
+    temp_data_dir,
+):
+    channel = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="management-secret",
+    )
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    payload = _auth_files_payload(
+        observed_at=now_iso,
+        signals=_signals_dict(primary_used="37"),
+    )
+    seen: list[tuple[str, str]] = []
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        assert request.headers["authorization"] == "Bearer management-secret"
+        if request.method == "GET" and request.url.path.endswith(
+            "/v0/management/auth-files"
+        ):
+            return httpx.Response(200, json=payload)
+        raise AssertionError(f"unexpected CPAMP request: {request.method} {request.url}")
+
+    class MockUpstreamClient:
+        def __init__(self, **kwargs):
+            options = dict(kwargs)
+            options["transport"] = httpx.MockTransport(handler)
+            self._client = real_async_client(**options)
+
+        async def __aenter__(self):
+            return await self._client.__aenter__()
+
+        async def __aexit__(self, *args):
+            return await self._client.__aexit__(*args)
+
+    with patch("app.quota_sync.httpx.AsyncClient", MockUpstreamClient):
+        assert await collect_cpamp_channel(channel) is True
+
+    assert seen == [("GET", "/v0/management/auth-files")]
+    cached = db.list_cached_cpa_channels(
+        enabled_only=False, include_credential_details=True
+    )[0]
+    account = cached["accounts"][0]
+    assert cached["snapshot_source"] == "auth_files"
+    assert account["quota_source"] == "auth_files"
+    assert account["account"] == "p***@example.test"
+    assert account["auth_file_masked"]
+    assert account["windows"][0]["used"] == 37.0
+    assert "auth-1" not in str(account)
+
+
+@pytest.mark.asyncio
 async def test_cpamp_query_404_falls_back_to_header_endpoint(temp_data_dir):
     channel = db.create_cpamp_channel(
         name="CPAMP",
@@ -882,3 +939,492 @@ async def test_cpamp_collection_logs_unified_cpa_source(temp_data_dir, caplog):
     )
     assert completed.event_fields["provider"] == "cpa"
     assert completed.event_fields["quota_source"] == "cpamp_snapshot"
+
+
+def _signals_dict(
+    *,
+    plan_type: str | None = "pro",
+    primary_used: str = "25",
+    primary_minutes: str = "300",
+    primary_reset_after: str = "1800",
+) -> dict[str, str]:
+    signals: dict[str, str] = {
+        "X-Codex-Primary-Used-Percent": primary_used,
+        "X-Codex-Primary-Window-Minutes": primary_minutes,
+        "X-Codex-Primary-Reset-After-Seconds": primary_reset_after,
+    }
+    if plan_type is not None:
+        signals["X-Codex-Plan-Type"] = plan_type
+    return signals
+
+
+def _auth_files_payload(
+    *,
+    auth_index: str = "auth-1",
+    name: str = "account-1.json",
+    email: str = "person@example.test",
+    observed_at: str = "2026-08-15T01:00:00Z",
+    signals: dict[str, str] | None = None,
+    id_token_plan: str = "plus",
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "provider": "codex",
+        "auth_index": auth_index,
+        "name": name,
+        "email": email,
+        "id_token": {"plan_type": id_token_plan},
+    }
+    if signals is not None:
+        entry["quota"] = {"observed_at": observed_at, "signals": signals}
+    return {"files": [entry]}
+
+
+def test_cpamp_parse_auth_files_marks_plan_from_signals_and_observed_at(
+    temp_data_dir,
+):
+    account = parse_cpamp_auth_files(
+        _auth_files_payload(
+            observed_at="2026-08-15T01:00:00Z",
+            signals=_signals_dict(plan_type="pro"),
+        )
+    )[0]
+    assert account.plan_from_signals is True
+    assert account.plan_observed_at == "2026-08-15T01:00:00Z"
+    assert account.plan == "Pro 20x"
+
+
+def test_cpamp_parse_auth_files_without_signal_plan_keeps_weak_plan(temp_data_dir):
+    account = parse_cpamp_auth_files(
+        _auth_files_payload(
+            observed_at="2026-08-15T01:00:00Z",
+            signals=_signals_dict(plan_type=None),
+        )
+    )[0]
+    assert account.plan_from_signals is False
+    assert account.plan_observed_at is None
+    assert account.plan == "Plus"
+
+
+def test_cpamp_signal_snapshot_marks_old_observation_stale(temp_data_dir):
+    old = (
+        datetime.now(UTC) - timedelta(hours=7)
+    ).isoformat().replace("+00:00", "Z")
+    account = parse_cpamp_auth_files(
+        _auth_files_payload(observed_at=old, signals=_signals_dict())
+    )[0]
+    snapshot = parse_cpamp_signal_snapshot(account)
+    assert snapshot.source == "auth_files"
+    assert snapshot.stale is True
+    assert snapshot.windows[0]["used"] == 25.0
+
+
+def test_cpamp_signal_snapshot_fresh_observation_not_stale(temp_data_dir):
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    account = parse_cpamp_auth_files(
+        _auth_files_payload(observed_at=now_iso, signals=_signals_dict())
+    )[0]
+    snapshot = parse_cpamp_signal_snapshot(account)
+    assert snapshot.stale is False
+
+
+def test_cpamp_signal_snapshot_rejects_incomplete_or_invalid_observation(
+    temp_data_dir,
+):
+    account = parse_cpamp_auth_files(
+        _auth_files_payload(
+            observed_at="not-a-timestamp",
+            signals={"X-Codex-Plan-Type": "pro"},
+        )
+    )[0]
+    with pytest.raises(CPAMPError):
+        parse_cpamp_signal_snapshot(account)
+
+
+@pytest.mark.asyncio
+async def test_cpamp_incomplete_auth_files_signals_fall_back_to_query(temp_data_dir):
+    channel = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    account = parse_cpamp_auth_files(
+        _auth_files_payload(
+            observed_at=now_iso,
+            signals={"X-Codex-Plan-Type": "pro"},
+        )
+    )[0]
+    query = AsyncMock(return_value=[_query_item(account, used=55)])
+    header = AsyncMock(return_value=[])
+    with (
+        patch(
+            "app.quota_sync.discover_cpamp_accounts",
+            AsyncMock(return_value=[account]),
+        ),
+        patch("app.quota_sync.query_cpamp_snapshots_batch", query),
+        patch("app.quota_sync.fetch_cpamp_header_snapshots", header),
+    ):
+        assert await collect_cpamp_channel(channel) is True
+
+    query.assert_awaited_once()
+    header.assert_not_awaited()
+    cached = db.list_cached_cpamp_channels(enabled_only=False)[0]
+    assert cached["accounts"][0]["quota_source"] == "quota_snapshots"
+    assert cached["accounts"][0]["windows"][0]["used"] == 55.0
+
+
+@pytest.mark.asyncio
+async def test_cpamp_signal_main_path_writes_auth_files_without_query(
+    temp_data_dir,
+):
+    channel = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    account = parse_cpamp_auth_files(
+        _auth_files_payload(observed_at=now_iso, signals=_signals_dict())
+    )[0]
+    query = AsyncMock(return_value=[])
+    header = AsyncMock(return_value=[])
+    with (
+        patch(
+            "app.quota_sync.discover_cpamp_accounts",
+            AsyncMock(return_value=[account]),
+        ),
+        patch("app.quota_sync.query_cpamp_snapshots_batch", query),
+        patch("app.quota_sync.fetch_cpamp_header_snapshots", header),
+    ):
+        assert await collect_cpamp_channel(channel) is True
+
+    query.assert_not_awaited()
+    header.assert_not_awaited()
+    cached = db.list_cached_cpamp_channels(enabled_only=False)[0]
+    assert cached["success"] is True
+    assert cached["snapshot_source"] == "auth_files"
+    assert cached["accounts"][0]["success"] is True
+    assert cached["accounts"][0]["quota_source"] == "auth_files"
+    assert cached["accounts"][0]["plan"] == "Pro 20x"
+    assert cached["accounts"][0]["windows"][0]["used"] == 25.0
+    assert b"auth-1" not in db.db_path().read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_cpamp_mixed_accounts_split_between_auth_files_and_query(
+    temp_data_dir,
+):
+    channel = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    signal_account = parse_cpamp_auth_files(
+        _auth_files_payload(
+            auth_index="auth-sig",
+            name="sig.json",
+            email="sig@example.test",
+            observed_at=now_iso,
+            signals=_signals_dict(),
+        )
+    )[0]
+    fallback_account = parse_cpamp_auth_files(
+        _auth_files_payload(
+            auth_index="auth-fb",
+            name="fb.json",
+            email="fb@example.test",
+            signals=None,
+        )
+    )[0]
+    query = AsyncMock(return_value=[_query_item(fallback_account, used=40)])
+    header = AsyncMock(return_value=[])
+    with (
+        patch(
+            "app.quota_sync.discover_cpamp_accounts",
+            AsyncMock(return_value=[signal_account, fallback_account]),
+        ),
+        patch("app.quota_sync.query_cpamp_snapshots_batch", query),
+        patch("app.quota_sync.fetch_cpamp_header_snapshots", header),
+    ):
+        assert await collect_cpamp_channel(channel) is True
+
+    query.assert_awaited_once()
+    header.assert_not_awaited()
+    cached = db.list_cached_cpamp_channels(enabled_only=False)[0]
+    by_account = {item["account"]: item for item in cached["accounts"]}
+    assert by_account[signal_account.account_display]["quota_source"] == "auth_files"
+    assert by_account[signal_account.account_display]["windows"][0]["used"] == 25.0
+    assert (
+        by_account[fallback_account.account_display]["quota_source"]
+        == "quota_snapshots"
+    )
+    assert by_account[fallback_account.account_display]["windows"][0]["used"] == 40.0
+    assert cached["snapshot_source"] == "auth_files"
+
+
+@pytest.mark.asyncio
+async def test_cpamp_all_fallback_query_404_falls_back_to_headers(temp_data_dir):
+    channel = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    account = parse_cpamp_auth_files(
+        _auth_files_payload(
+            auth_index="auth-1",
+            name="account-1.json",
+            email="person@example.test",
+            signals=None,
+        )
+    )[0]
+    query = AsyncMock(side_effect=CPAMPQueryUnsupported("query unavailable"))
+    header = AsyncMock(
+        return_value=[
+            {
+                "timestamp_ms": int(datetime.now(UTC).timestamp() * 1000),
+                "auth_file_snapshot": account.auth_file_name,
+                "auth_index": account.auth_index,
+                "account_snapshot": "person@example.test",
+                "response_metadata": {
+                    "quota": {
+                        "primary": {
+                            "used_percent": 30,
+                            "reset_after_seconds": 1800,
+                            "window_minutes": 300,
+                        }
+                    }
+                },
+            }
+        ]
+    )
+    with (
+        patch(
+            "app.quota_sync.discover_cpamp_accounts",
+            AsyncMock(return_value=[account]),
+        ),
+        patch("app.quota_sync.query_cpamp_snapshots_batch", query),
+        patch("app.quota_sync.fetch_cpamp_header_snapshots", header),
+    ):
+        assert await collect_cpamp_channel(channel) is True
+
+    query.assert_awaited_once()
+    header.assert_awaited_once()
+    cached = db.list_cached_cpamp_channels(enabled_only=False)[0]
+    assert cached["success"] is True
+    assert cached["snapshot_source"] == "header_snapshots"
+    assert cached["accounts"][0]["quota_source"] == "header_snapshots"
+    assert cached["accounts"][0]["windows"][0]["used"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_cpamp_signal_old_observation_marks_snapshot_stale(temp_data_dir):
+    channel = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    old = (
+        datetime.now(UTC) - timedelta(hours=7)
+    ).isoformat().replace("+00:00", "Z")
+    account = parse_cpamp_auth_files(
+        _auth_files_payload(observed_at=old, signals=_signals_dict())
+    )[0]
+    with (
+        patch(
+            "app.quota_sync.discover_cpamp_accounts",
+            AsyncMock(return_value=[account]),
+        ),
+        patch("app.quota_sync.query_cpamp_snapshots_batch", AsyncMock(return_value=[])),
+        patch(
+            "app.quota_sync.fetch_cpamp_header_snapshots", AsyncMock(return_value=[])
+        ),
+    ):
+        assert await collect_cpamp_channel(channel) is True
+    cached = db.list_cached_cpamp_channels(enabled_only=False)[0]
+    assert cached["accounts"][0]["stale"] is True
+    assert cached["accounts"][0]["quota_source"] == "auth_files"
+    assert cached["accounts"][0]["windows"][0]["used"] == 25.0
+
+
+@pytest.mark.asyncio
+async def test_cpamp_signal_parse_failure_isolates_account(temp_data_dir):
+    channel = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    good = parse_cpamp_auth_files(
+        _auth_files_payload(
+            auth_index="auth-good",
+            name="good.json",
+            email="good@example.test",
+            observed_at=now_iso,
+            signals=_signals_dict(),
+        )
+    )[0]
+    bad = parse_cpamp_auth_files(
+        _auth_files_payload(
+            auth_index="auth-bad",
+            name="bad.json",
+            email="bad@example.test",
+            observed_at=now_iso,
+            signals=_signals_dict(),
+        )
+    )[0]
+    with (
+        patch(
+            "app.quota_sync.discover_cpamp_accounts",
+            AsyncMock(return_value=[good, bad]),
+        ),
+        patch(
+            "app.quota_sync.parse_cpamp_signal_snapshot",
+            side_effect=[parse_cpamp_signal_snapshot(good), RuntimeError("parse-bang")],
+        ),
+        patch("app.quota_sync.query_cpamp_snapshots_batch", AsyncMock(return_value=[])),
+        patch(
+            "app.quota_sync.fetch_cpamp_header_snapshots", AsyncMock(return_value=[])
+        ),
+    ):
+        assert await collect_cpamp_channel(channel) is True
+    cached = db.list_cached_cpamp_channels(enabled_only=False)[0]
+    by_account = {item["account"]: item for item in cached["accounts"]}
+    assert by_account[good.account_display]["success"] is True
+    assert by_account[good.account_display]["quota_source"] == "auth_files"
+    assert by_account[bad.account_display]["success"] is False
+    assert b"parse-bang" not in db.db_path().read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_cpamp_discovery_failure_rediscovery_preserves_strong_plan(
+    temp_data_dir,
+):
+    channel = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    now = datetime.now(UTC)
+    t1 = (now - timedelta(seconds=10)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    signal_account = parse_cpamp_auth_files(
+        _auth_files_payload(
+            auth_index="auth-1",
+            name="account-1.json",
+            email="person@example.test",
+            observed_at=t1,
+            signals=_signals_dict(plan_type="pro"),
+        )
+    )[0]
+    with (
+        patch(
+            "app.quota_sync.discover_cpamp_accounts",
+            AsyncMock(return_value=[signal_account]),
+        ),
+        patch("app.quota_sync.query_cpamp_snapshots_batch", AsyncMock(return_value=[])),
+        patch(
+            "app.quota_sync.fetch_cpamp_header_snapshots", AsyncMock(return_value=[])
+        ),
+    ):
+        assert await collect_cpamp_channel(channel) is True
+    cached = db.list_cached_cpamp_channels(enabled_only=False)[0]
+    assert cached["accounts"][0]["plan"] == "Pro 20x"
+    assert cached["accounts"][0]["quota_source"] == "auth_files"
+
+    # Discovery fails; the stored-account fallback drives rediscovery. The
+    # header carries no plan_type, so the stored strong plan is what surfaces.
+    header_observed_ms = int(now.timestamp() * 1000)
+    with (
+        patch(
+            "app.quota_sync.discover_cpamp_accounts",
+            AsyncMock(side_effect=RuntimeError("private-discovery-error")),
+        ),
+        patch(
+            "app.quota_sync.fetch_cpamp_header_snapshots",
+            AsyncMock(
+                return_value=[
+                    {
+                        "timestamp_ms": header_observed_ms,
+                        "auth_file_snapshot": signal_account.auth_file_name,
+                        "auth_index": signal_account.auth_index,
+                        "account_snapshot": "person@example.test",
+                        "response_metadata": {
+                            "quota": {
+                                "primary": {
+                                    "used_percent": 30,
+                                    "reset_after_seconds": 1800,
+                                    "window_minutes": 300,
+                                }
+                            }
+                        },
+                    }
+                ]
+            ),
+        ),
+    ):
+        assert await collect_cpamp_channel(channel) is True
+
+    cached = db.list_cached_cpamp_channels(enabled_only=False)[0]
+    assert cached["accounts"][0]["plan"] == "Pro 20x"
+    assert cached["accounts"][0]["quota_source"] == "header_snapshots"
+    assert b"private-discovery-error" not in db.db_path().read_bytes()
+
+
+def test_cpamp_parse_passes_through_masked_credential_fields(temp_data_dir):
+    raw_name = "codex-account-sensitive.json"
+    raw_project_id = "proj-secret-1234567890"
+    accounts = parse_cpamp_auth_files(
+        {
+            "files": [
+                {
+                    "provider": "codex",
+                    "auth_index": "auth-index-sensitive",
+                    "name": raw_name,
+                    "email": "alice@example.com",
+                    "project_id": raw_project_id,
+                    "account_type": "pro",
+                }
+            ]
+        }
+    )
+    assert len(accounts) == 1
+    account = accounts[0]
+    assert account.auth_file_masked == mask_auth_file_name(raw_name)
+    assert account.auth_tag.startswith("#")
+    assert len(account.auth_tag) == 7
+    assert account.provider == "codex"
+    assert account.project_id_masked == "pr***90"
+    # Raw identity values must not appear in the masked fields.
+    assert raw_name not in account.auth_file_masked
+    assert raw_project_id not in account.project_id_masked
+
+
+def test_cpamp_header_fallback_derives_auth_file_masked_and_tag(temp_data_dir):
+    observed_ms = int(datetime(2026, 8, 15, 1, 0, tzinfo=UTC).timestamp() * 1000)
+    raw_auth_file = "ephemeral-account.json"
+    raw_auth_index = "header-auth-index-sensitive"
+    snapshots = parse_cpamp_header_items(
+        [
+            {
+                "timestamp_ms": observed_ms,
+                "auth_file_snapshot": raw_auth_file,
+                "auth_index": raw_auth_index,
+                "account_snapshot": "person@example.test",
+                "response_metadata": {
+                    "quota": {"primary": {"used_percent": 20}}
+                },
+            }
+        ]
+    )
+    assert len(snapshots) == 1
+    account = snapshots[0].account
+    # Header fallback can derive the masked file name and an auth tag from the
+    # header identity; provider and project_id_masked stay at their defaults.
+    assert account.auth_file_masked == mask_auth_file_name(raw_auth_file)
+    assert account.auth_tag.startswith("#")
+    assert len(account.auth_tag) == 7
+    assert account.provider == "unknown"
+    assert account.project_id_masked == ""
+    # Raw identity values must not leak into the masked fields.
+    assert raw_auth_file not in account.auth_file_masked
+    assert raw_auth_index not in account.auth_tag

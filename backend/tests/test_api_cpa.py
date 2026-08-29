@@ -334,3 +334,159 @@ def test_channel_update_reports_only_actual_sync_scheduling(temp_data_dir):
     fetched = client.get(f"/api/admin/cpa/channels/{channel_id}")
     assert fetched.status_code == 200
     assert "sync_scheduled" not in fetched.json()
+
+
+def _discover_cpa_account(channel_id: str) -> None:
+    """Run the real parse -> adapter -> discovery flow for one codex account."""
+    from app.cpa_quota import parse_auth_files
+    from app.quota_sync import _cpa_discovery_account
+
+    account = parse_auth_files(
+        {
+            "files": [
+                {
+                    "provider": "codex",
+                    "auth_index": "auth-index-sensitive",
+                    "name": "codex-account-sensitive.json",
+                    "email": "alice@example.com",
+                    "project_id": "proj-secret-1234567890",
+                    "account_type": "pro",
+                }
+            ]
+        }
+    )[0]
+    db.prepare_cpa_channel_discovery(
+        channel_id,
+        [_cpa_discovery_account(account)],
+        source_mode="native_queue",
+    )
+
+
+def test_admin_cpa_channel_detail_exposes_masked_credentials_only(temp_data_dir):
+    client = _admin_client()
+    created = client.post(
+        "/api/admin/cpa/channels",
+        json={
+            "name": "Primary CPA",
+            "cpa_endpoint": {
+                "url": "https://proxy.example.com/",
+                "management_key": "management-key",
+            },
+            "interval_sec": 600,
+        },
+    )
+    channel_id = created.json()["id"]
+    _discover_cpa_account(channel_id)
+
+    detail = client.get(f"/api/admin/cpa/channels/{channel_id}")
+    assert detail.status_code == 200
+    accounts = detail.json()["accounts"]
+    assert len(accounts) == 1
+    item = accounts[0]
+    assert item["auth_file_masked"] == "co***e.json"
+    assert item["auth_tag"].startswith("#")
+    assert len(item["auth_tag"]) == 7
+    assert item["provider"] == "codex"
+    assert item["project_id_masked"] == "pr***90"
+    # Raw upstream identity fields must never appear in the admin DTO.
+    for key in ("auth_file_name", "auth_index", "note", "label", "fileName"):
+        assert key not in item
+    blob = "|".join(f"{k}={item[k]}" for k in item)
+    assert "codex-account-sensitive.json" not in blob
+    assert "proj-secret-1234567890" not in blob
+    assert "auth-index-sensitive" not in blob
+
+
+def test_admin_cpa_channel_list_exposes_masked_credentials_only(temp_data_dir):
+    client = _admin_client()
+    created = client.post(
+        "/api/admin/cpa/channels",
+        json={
+            "name": "Primary CPA",
+            "cpa_endpoint": {
+                "url": "https://proxy.example.com/",
+                "management_key": "management-key",
+            },
+            "interval_sec": 600,
+        },
+    )
+    channel_id = created.json()["id"]
+    _discover_cpa_account(channel_id)
+
+    listed = client.get("/api/admin/cpa/channels")
+    assert listed.status_code == 200
+    channels = listed.json()
+    assert len(channels) == 1
+    item = channels[0]["accounts"][0]
+    assert item["auth_file_masked"] == "co***e.json"
+    assert item["auth_tag"].startswith("#")
+    assert len(item["auth_tag"]) == 7
+    assert item["provider"] == "codex"
+    assert item["project_id_masked"] == "pr***90"
+    # Raw upstream identity fields must never appear in the admin DTO.
+    for key in ("auth_file_name", "auth_index", "note", "label", "fileName"):
+        assert key not in item
+    blob = "|".join(f"{k}={item[k]}" for k in item)
+    assert "codex-account-sensitive.json" not in blob
+    assert "proj-secret-1234567890" not in blob
+    assert "auth-index-sensitive" not in blob
+
+    # Public quota stays free of credential fields.
+    public = TestClient(app).get("/api/public/quota")
+    assert public.status_code == 200
+    public_item = public.json()["cpa_channels"][0]["accounts"][0]
+    for key in ("auth_file_masked", "auth_tag", "provider", "project_id_masked"):
+        assert key not in public_item
+
+
+def test_public_quota_excludes_credential_fields(temp_data_dir):
+    client = _admin_client()
+    created = client.post(
+        "/api/admin/cpa/channels",
+        json={
+            "name": "Public CPA",
+            "cpa_endpoint": {
+                "url": "https://proxy.example.com/",
+                "management_key": "management-key",
+            },
+            "interval_sec": 600,
+        },
+    )
+    channel_id = created.json()["id"]
+    _discover_cpa_account(channel_id)
+
+    public = TestClient(app).get("/api/public/quota")
+    assert public.status_code == 200
+    cpa_channels = public.json()["cpa_channels"]
+    assert len(cpa_channels) == 1
+    item = cpa_channels[0]["accounts"][0]
+    for key in ("auth_file_masked", "auth_tag", "provider", "project_id_masked"):
+        assert key not in item
+
+
+def test_analytics_overview_excludes_credential_fields(temp_data_dir):
+    client = _admin_client()
+    created = client.post(
+        "/api/admin/cpa/channels",
+        json={
+            "name": "Overview CPA",
+            "cpa_endpoint": {
+                "url": "https://proxy.example.com/",
+                "management_key": "management-key",
+            },
+            "interval_sec": 600,
+        },
+    )
+    channel_id = created.json()["id"]
+    _discover_cpa_account(channel_id)
+
+    overview = TestClient(app).get("/api/analytics/overview")
+    assert overview.status_code == 200
+    cpa_section = overview.json()["cpa"]
+    for key in ("auth_file_masked", "auth_tag", "provider", "project_id_masked"):
+        assert key not in cpa_section
+    # The default channel list (what build_overview reads) also stays clean.
+    for channel in db.list_cached_cpa_channels():
+        for account in channel.get("accounts") or []:
+            for key in ("auth_file_masked", "auth_tag", "provider", "project_id_masked"):
+                assert key not in account

@@ -2,8 +2,8 @@
 
 QuotaHub 是一个自托管额度看板，支持 OpenCode Go、Ollama Cloud 和多个
 CLIProxyAPI（CPA）渠道。CPA 渠道可按部署方式选择原生独占 usage queue 或
-CPA-Manager-Plus（CPAMP）只读快照。所有额度先写入 SQLite；浏览器刷新和轮询只读本地快照，
-不会直接请求上游。
+CPA-Manager-Plus（CPAMP）实时额度观测。所有额度先写入 SQLite；浏览器刷新和轮询只读本地快照，
+不会直接请求上游；管理员可手动触发即时采集。
 
 公开用户只能查看数据概览和账号额度。账号、CPA 渠道、使用记录与采集设置位于独立的
 管理员后台。
@@ -125,7 +125,7 @@ Uvicorn 的默认访问日志已关闭，避免其直接输出客户端 IP；管
 
 - `仅发现账号`：只通过 CPA 的 `/auth-files` 维护脱敏账号，不采集额度；
 - `原生 HTTP usage`：发现 CPA 账号并消费独占的 HTTP usage queue；
-- `CPAMP 快照`：只访问 CPAMP 已持久化的只读快照。
+- `CPAMP 快照`：读取 CPA 内存中的实时额度观测（`/auth-files` 的 `quota.signals`），无该字段时回退到 CPAMP 已持久化的只读快照。
 
 未选中的端点不会发起请求。渠道同步间隔默认 30 分钟，后端最短 5 分钟。两组管理密钥分别使用
 Fernet 加密，API 不会返回密钥、掩码或“已配置”标记。切换来源会立即停止旧来源的新请求；历史
@@ -174,25 +174,31 @@ queue 事件只在内存提取 `provider`、`auth_index`、时间和 `x-codex-*`
 IP、User-Agent、失败正文、文件名和 queue 原文不会写入 SQLite 或日志。数据库只保存脱敏账号、
 Fernet 派生 HMAC、随机公开 ID 和最新额度窗口。
 
-### CPAMP：只读持久化快照
+### CPAMP：实时额度观测
 
-选择 `CPAMP 快照` 后，QuotaHub 只读取该渠道 CPAMP 端点已持久化的数据：
+选择 `CPAMP 快照` 后，QuotaHub 读取 CPA 进程内存中的当前额度观测（比 Manager Server
+落库快照少一跳延迟）：
 
-1. `GET /v0/management/auth-files` 获取 Codex 账号清单；
-2. 优先按每批最多 200 个账号调用 `POST /v0/management/quota-snapshots/query`；
-3. 仅当 query 返回 `404/405` 时，兼容读取
+1. `GET /v0/management/auth-files` 一次性获取 Codex 账号清单与每个账号的 `quota.signals`
+   （`x-codex-primary-*` / `x-codex-secondary-*` / `x-codex-additional-*` 响应头水位，
+   含 `x-codex-plan-type`）；
+2. 有 `quota.signals` 的账号直接解析为额度窗口写入（标签按 `window-minutes` 时长判定，
+   命名空间名不可枚举，故按模式匹配而非白名单）；观测超过 6 小时标记为陈旧；
+3. 没有 `quota` 字段的账号（CPA 版本过旧）回退到批量
+   `POST /v0/management/quota-snapshots/query`（每批 200 个），再 404/405 回退到
    `GET /v0/management/monitoring/header-snapshots?days=30&limit=5000`；
 4. `/auth-files` 暂时不可用时，可用 Header Snapshot 的身份字段构建本轮内存映射。
 
 CPAMP 模式不会调用 `/api-call`，也不会主动请求 ChatGPT。`account_key`、邮箱、文件名和
-`auth_index` 只用于单次内存映射，不进入 QuotaHub 数据库、API 或日志。
+`auth_index` 只用于单次内存映射，不进入 QuotaHub 数据库、API 或日志；账号工作台仅展示
+两列脱敏信息：凭证/账号（掩码文件名与账号）和额度信息（套餐、窗口与新鲜度），且仅管理员可见。
 
 前端不能自定义上游方法、路径或请求头。
 
 ## 采集行为
 
 - OpenCode、Ollama 使用服务级间隔；CPA 账号发现或 CPAMP 快照同步按渠道独立配置。
-- 新增、更新凭证或重新启用后会排入后台采集，不提供手动上游刷新接口。
+- 新增、更新凭证或重新启用后会排入后台采集；管理员也可在账号管理页点「刷新」即时触发一次采集（OpenCode、Ollama、CPA 渠道均支持，复用同一 SQLite 租约保证单飞）。
 - 普通额度同步与 CPA queue 分别使用 SQLite 租约，多 worker 共享同一 SQLite 时保持单飞。
 - CPA queue 每批最多 100 条、单周期最多 10 批；租约丢失后不再发起下一次请求，已经 pop 的批次
   仍会完成安全解析和落库。

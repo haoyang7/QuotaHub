@@ -242,6 +242,7 @@ def init_db() -> None:
                 observed_at TEXT,
                 accept_observed_after TEXT,
                 last_active_attempt_at TEXT,
+                plan_observed_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (channel_id, account_key_hash)
@@ -256,8 +257,13 @@ def init_db() -> None:
                 public_id TEXT NOT NULL UNIQUE,
                 account_display TEXT NOT NULL,
                 plan TEXT NOT NULL DEFAULT '未知套餐',
+                plan_observed_at TEXT,
                 locator_hash TEXT,
                 subject_hash TEXT,
+                auth_file_masked TEXT,
+                auth_tag TEXT,
+                provider TEXT,
+                project_id_masked TEXT,
                 visible INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -319,10 +325,26 @@ def init_db() -> None:
             ("observed_at", "TEXT"),
             ("accept_observed_after", "TEXT"),
             ("last_active_attempt_at", "TEXT"),
+            ("plan_observed_at", "TEXT"),
         ):
             if column_name not in cpa_snapshot_columns:
                 conn.execute(
                     f"ALTER TABLE cpa_quota_snapshots ADD COLUMN {column_name} {column_type}"
+                )
+        cpa_account_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(cpa_accounts)").fetchall()
+        }
+        for column_name, column_type in (
+            ("plan_observed_at", "TEXT"),
+            ("auth_file_masked", "TEXT"),
+            ("auth_tag", "TEXT"),
+            ("provider", "TEXT"),
+            ("project_id_masked", "TEXT"),
+        ):
+            if column_name not in cpa_account_columns:
+                conn.execute(
+                    f"ALTER TABLE cpa_accounts ADD COLUMN {column_name} {column_type}"
                 )
         cpa_channel_columns = {
             row["name"]
@@ -808,6 +830,11 @@ class CPAMPDiscoveryAccount:
     subject_hash: str
     account_display: str
     plan: str
+    plan_observed_at: str | None = None
+    auth_file_masked: str = ""
+    auth_tag: str = ""
+    provider: str = "unknown"
+    project_id_masked: str = ""
 
 
 @dataclass(frozen=True)
@@ -818,6 +845,11 @@ class CPADiscoveryAccount:
     subject_hash: str
     account_display: str
     plan: str
+    plan_observed_at: str | None = None
+    auth_file_masked: str = ""
+    auth_tag: str = ""
+    provider: str = "unknown"
+    project_id_masked: str = ""
 
 
 @dataclass(frozen=True)
@@ -1829,6 +1861,11 @@ def prepare_cpamp_channel_discovery(
                 subject_hash=account.subject_hash,
                 account_display=account.account_display,
                 plan=account.plan,
+                plan_observed_at=account.plan_observed_at,
+                auth_file_masked=account.auth_file_masked,
+                auth_tag=account.auth_tag,
+                provider=account.provider,
+                project_id_masked=account.project_id_masked,
             )
             for account in (
                 _coerce_cpamp_discovery_account(value) for value in accounts or []
@@ -1857,6 +1894,7 @@ def record_cpamp_quota_snapshot(
     expected_collection_revision: int | None = None,
     lease_name: str | None = None,
     lease_owner_id: str | None = None,
+    plan_observed_at: str | None = None,
 ) -> SnapshotWriteResult:
     with get_conn() as conn:
         channel_row = conn.execute(
@@ -1916,6 +1954,7 @@ def record_cpamp_quota_snapshot(
         expected_collection_revision=expected_collection_revision,
         lease_name=lease_name,
         lease_owner_id=lease_owner_id,
+        plan_observed_at=plan_observed_at,
     )
     return SnapshotWriteResult(public_id=public_id, applied=True)
 
@@ -1927,7 +1966,7 @@ def list_cpamp_snapshot_identities(
         rows = conn.execute(
             """
             SELECT s.canonical_account_hash, s.locator_hash, s.subject_hash,
-                s.account_display, s.plan
+                s.account_display, s.plan, s.plan_observed_at
             FROM cpa_quota_snapshots s
             JOIN cpa_channels c ON c.id = s.channel_id
             WHERE s.channel_id = ? AND s.source_mode = 'cpamp_snapshot'
@@ -1945,6 +1984,7 @@ def list_cpamp_snapshot_identities(
             subject_hash=row["subject_hash"] or "",
             account_display=row["account_display"],
             plan=row["plan"],
+            plan_observed_at=row["plan_observed_at"],
         )
         for row in rows
     ]
@@ -2002,6 +2042,11 @@ def _upsert_cpa_account(
     plan: str,
     visible: bool | None,
     now: str,
+    plan_observed_at: str | None = None,
+    auth_file_masked: str = "",
+    auth_tag: str = "",
+    provider: str = "unknown",
+    project_id_masked: str = "",
 ) -> str:
     existing = conn.execute(
         """
@@ -2026,23 +2071,54 @@ def _upsert_cpa_account(
         conn.execute(
             """
             UPDATE cpa_accounts
-            SET locator_hash = COALESCE(NULLIF(?, ''), locator_hash),
-                subject_hash = COALESCE(NULLIF(?, ''), subject_hash),
-                account_display = ?,
-                plan = CASE WHEN plan = '未知套餐' THEN ? ELSE plan END,
-                visible = COALESCE(?, visible), updated_at = ?
-            WHERE channel_id = ? AND canonical_account_hash = ?
+            SET locator_hash = COALESCE(NULLIF(:locator_hash, ''), locator_hash),
+                subject_hash = COALESCE(NULLIF(:subject_hash, ''), subject_hash),
+                account_display = :account_display,
+                plan = CASE
+                    WHEN :new_plan = '未知套餐' THEN plan
+                    WHEN plan = '未知套餐' THEN :new_plan
+                    WHEN :new_obs IS NULL THEN plan
+                    WHEN plan_observed_at IS NULL
+                        OR :new_obs >= plan_observed_at
+                    THEN :new_plan
+                    ELSE plan
+                END,
+                plan_observed_at = CASE
+                    WHEN :new_obs IS NOT NULL
+                        AND :new_plan != '未知套餐'
+                        AND (
+                            plan = '未知套餐'
+                            OR plan_observed_at IS NULL
+                            OR :new_obs >= plan_observed_at
+                        )
+                    THEN :new_obs
+                    ELSE plan_observed_at
+                END,
+                auth_file_masked = COALESCE(NULLIF(:auth_file_masked, ''), auth_file_masked),
+                auth_tag = COALESCE(NULLIF(:auth_tag, ''), auth_tag),
+                provider = CASE
+                    WHEN :provider IN ('codex', 'claude') THEN :provider
+                    ELSE provider
+                END,
+                project_id_masked = COALESCE(NULLIF(:project_id_masked, ''), project_id_masked),
+                visible = COALESCE(:visible, visible), updated_at = :now
+            WHERE channel_id = :channel_id AND canonical_account_hash = :stable_hash
             """,
-            (
-                locator_hash,
-                subject_hash,
-                account_display,
-                plan,
-                None if visible is None else int(visible),
-                now,
-                channel_id,
-                stable_hash,
-            ),
+            {
+                "locator_hash": locator_hash,
+                "subject_hash": subject_hash,
+                "account_display": account_display,
+                "new_plan": plan,
+                "new_obs": plan_observed_at,
+                "auth_file_masked": auth_file_masked,
+                "auth_tag": auth_tag,
+                "provider": provider,
+                "project_id_masked": project_id_masked,
+                "visible": None if visible is None else int(visible),
+                "now": now,
+                "channel_id": channel_id,
+                "stable_hash": stable_hash,
+            },
         )
         return stable_hash
     public_id = str(uuid.uuid4())
@@ -2050,8 +2126,10 @@ def _upsert_cpa_account(
         """
         INSERT INTO cpa_accounts (
             channel_id, canonical_account_hash, public_id, account_display,
-            plan, locator_hash, subject_hash, visible, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            plan, plan_observed_at, locator_hash, subject_hash, auth_file_masked,
+            auth_tag, provider, project_id_masked, visible,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             channel_id,
@@ -2059,8 +2137,13 @@ def _upsert_cpa_account(
             public_id,
             account_display,
             plan,
+            plan_observed_at,
             locator_hash or None,
             subject_hash or None,
+            auth_file_masked,
+            auth_tag,
+            provider,
+            project_id_masked,
             int(bool(visible)),
             now,
             now,
@@ -2186,6 +2269,11 @@ def prepare_cpa_channel_discovery(
                 plan=account.plan,
                 visible=True,
                 now=now,
+                plan_observed_at=account.plan_observed_at,
+                auth_file_masked=account.auth_file_masked,
+                auth_tag=account.auth_tag,
+                provider=account.provider,
+                project_id_masked=account.project_id_masked,
             )
             account_key_hash = _snapshot_storage_hash(
                 source_mode, canonical_account_hash, endpoint_revision
@@ -2304,9 +2392,10 @@ def prepare_cpa_channel_discovery(
                 INSERT INTO cpa_quota_snapshots (
                     channel_id, account_key_hash, canonical_account_hash,
                     source_mode, endpoint_revision, locator_hash, subject_hash,
-                    public_id, account_display, plan, windows_json, visible,
-                    accept_observed_after, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 1, ?, ?, ?)
+                    public_id, account_display, plan, plan_observed_at,
+                    windows_json, visible, accept_observed_after, created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 1, ?, ?, ?)
                 ON CONFLICT(channel_id, account_key_hash) DO NOTHING
                 """,
                 (
@@ -2320,6 +2409,7 @@ def prepare_cpa_channel_discovery(
                     str(uuid.uuid4()),
                     account.account_display,
                     account.plan,
+                    account.plan_observed_at,
                     now if replacement else None,
                     now,
                     now,
@@ -2328,32 +2418,51 @@ def prepare_cpa_channel_discovery(
             conn.execute(
                 """
                 UPDATE cpa_quota_snapshots
-                SET locator_hash = ?,
-                    subject_hash = COALESCE(NULLIF(?, ''), subject_hash),
-                    canonical_account_hash = ?, source_mode = ?,
-                    endpoint_revision = ?,
-                    account_display = ?,
+                SET locator_hash = :locator_hash,
+                    subject_hash = COALESCE(NULLIF(:subject_hash, ''), subject_hash),
+                    canonical_account_hash = :canonical_account_hash,
+                    source_mode = :source_mode,
+                    endpoint_revision = :endpoint_revision,
+                    account_display = :account_display,
                     plan = CASE
-                        WHEN last_success_at IS NULL OR plan = '未知套餐' THEN ?
+                        WHEN :new_plan = '未知套餐' THEN plan
+                        WHEN plan = '未知套餐' THEN :new_plan
+                        WHEN :new_obs IS NULL THEN plan
+                        WHEN plan_observed_at IS NULL
+                            OR :new_obs >= plan_observed_at
+                        THEN :new_plan
                         ELSE plan
                     END,
+                    plan_observed_at = CASE
+                        WHEN :new_obs IS NOT NULL
+                            AND :new_plan != '未知套餐'
+                            AND (
+                                plan = '未知套餐'
+                                OR plan_observed_at IS NULL
+                                OR :new_obs >= plan_observed_at
+                            )
+                        THEN :new_obs
+                        ELSE plan_observed_at
+                    END,
                     visible = 1,
-                    updated_at = ?
-                WHERE channel_id = ? AND account_key_hash = ? AND source_mode = ?
+                    updated_at = :now
+                WHERE channel_id = :channel_id
+                    AND account_key_hash = :account_key_hash
+                    AND source_mode = :source_mode
                 """,
-                (
-                    account.locator_hash,
-                    account.subject_hash,
-                    canonical_account_hash,
-                    source_mode,
-                    endpoint_revision,
-                    account.account_display,
-                    account.plan,
-                    now,
-                    channel_id,
-                    account_key_hash,
-                    source_mode,
-                ),
+                {
+                    "locator_hash": account.locator_hash,
+                    "subject_hash": account.subject_hash,
+                    "canonical_account_hash": canonical_account_hash,
+                    "source_mode": source_mode,
+                    "endpoint_revision": endpoint_revision,
+                    "account_display": account.account_display,
+                    "new_plan": account.plan,
+                    "new_obs": account.plan_observed_at,
+                    "now": now,
+                    "channel_id": channel_id,
+                    "account_key_hash": account_key_hash,
+                },
             )
 
 
@@ -2376,6 +2485,7 @@ def record_cpa_quota_snapshot(
     expected_collection_revision: int | None = None,
     lease_name: str | None = None,
     lease_owner_id: str | None = None,
+    plan_observed_at: str | None = None,
 ) -> str:
     canonical_account_hash = account_key_hash
     now = attempted_at or _now_iso()
@@ -2417,6 +2527,7 @@ def record_cpa_quota_snapshot(
             plan=plan,
             visible=True,
             now=now,
+            plan_observed_at=plan_observed_at,
         )
         account_key_hash = _snapshot_storage_hash(
             source_mode, canonical_account_hash, endpoint_revision
@@ -2487,13 +2598,36 @@ def record_cpa_quota_snapshot(
                 INSERT INTO cpa_quota_snapshots (
                     channel_id, account_key_hash, canonical_account_hash,
                     source_mode, endpoint_revision, public_id, account_display, plan,
-                    windows_json, visible, last_attempt_at, last_success_at,
-                    last_attempt_status, stale, error, quota_source, observed_at,
-                    last_active_attempt_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'success', ?, NULL, ?, ?, ?, ?, ?)
+                    plan_observed_at, windows_json, visible, last_attempt_at,
+                    last_success_at, last_attempt_status, stale, error, quota_source,
+                    observed_at, last_active_attempt_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'success', ?, NULL, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel_id, account_key_hash) DO UPDATE SET
                     account_display = excluded.account_display,
-                    plan = excluded.plan,
+                    plan = CASE
+                        WHEN excluded.plan = '未知套餐'
+                            THEN cpa_quota_snapshots.plan
+                        WHEN cpa_quota_snapshots.plan = '未知套餐'
+                            THEN excluded.plan
+                        WHEN excluded.plan_observed_at IS NULL
+                            THEN cpa_quota_snapshots.plan
+                        WHEN cpa_quota_snapshots.plan_observed_at IS NULL
+                            OR excluded.plan_observed_at >= cpa_quota_snapshots.plan_observed_at
+                        THEN excluded.plan
+                        ELSE cpa_quota_snapshots.plan
+                    END,
+                    plan_observed_at = CASE
+                        WHEN excluded.plan_observed_at IS NOT NULL
+                            AND excluded.plan != '未知套餐'
+                            AND (
+                                cpa_quota_snapshots.plan = '未知套餐'
+                                OR cpa_quota_snapshots.plan_observed_at IS NULL
+                                OR excluded.plan_observed_at
+                                    >= cpa_quota_snapshots.plan_observed_at
+                            )
+                        THEN excluded.plan_observed_at
+                        ELSE cpa_quota_snapshots.plan_observed_at
+                    END,
                     windows_json = excluded.windows_json,
                     visible = 1,
                     last_attempt_at = excluded.last_attempt_at,
@@ -2518,6 +2652,7 @@ def record_cpa_quota_snapshot(
                     public_id,
                     account_display,
                     plan,
+                    plan_observed_at,
                     json.dumps(windows or [], ensure_ascii=False),
                     now,
                     now,
@@ -2535,13 +2670,36 @@ def record_cpa_quota_snapshot(
             INSERT INTO cpa_quota_snapshots (
                 channel_id, account_key_hash, canonical_account_hash,
                 source_mode, endpoint_revision, public_id, account_display, plan,
-                windows_json, visible, last_attempt_at, last_attempt_status,
-                stale, error, quota_source, observed_at, last_active_attempt_at,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', 1, ?, 'error', 0, ?, ?, ?, ?, ?, ?)
+                plan_observed_at, windows_json, visible, last_attempt_at,
+                last_attempt_status, stale, error, quota_source, observed_at,
+                last_active_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 1, ?, 'error', 0, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id, account_key_hash) DO UPDATE SET
                 account_display = excluded.account_display,
-                plan = excluded.plan,
+                plan = CASE
+                    WHEN excluded.plan = '未知套餐'
+                        THEN cpa_quota_snapshots.plan
+                    WHEN cpa_quota_snapshots.plan = '未知套餐'
+                        THEN excluded.plan
+                    WHEN excluded.plan_observed_at IS NULL
+                        THEN cpa_quota_snapshots.plan
+                    WHEN cpa_quota_snapshots.plan_observed_at IS NULL
+                        OR excluded.plan_observed_at >= cpa_quota_snapshots.plan_observed_at
+                    THEN excluded.plan
+                    ELSE cpa_quota_snapshots.plan
+                END,
+                plan_observed_at = CASE
+                    WHEN excluded.plan_observed_at IS NOT NULL
+                        AND excluded.plan != '未知套餐'
+                        AND (
+                            cpa_quota_snapshots.plan = '未知套餐'
+                            OR cpa_quota_snapshots.plan_observed_at IS NULL
+                            OR excluded.plan_observed_at
+                                >= cpa_quota_snapshots.plan_observed_at
+                        )
+                    THEN excluded.plan_observed_at
+                    ELSE cpa_quota_snapshots.plan_observed_at
+                END,
                 visible = 1,
                 last_attempt_at = excluded.last_attempt_at,
                 last_attempt_status = 'error',
@@ -2565,7 +2723,8 @@ def record_cpa_quota_snapshot(
                 endpoint_revision,
                 public_id,
                 account_display,
-                plan,
+                    plan,
+                    plan_observed_at,
                 now,
                 error,
                 quota_source,
@@ -2610,6 +2769,9 @@ def record_cpa_quota_batch(
             canonical_account_hash = str(snapshot["account_key_hash"])
             account_display = str(snapshot["account_display"])
             plan = str(snapshot["plan"])
+            plan_observed_at = snapshot.get("plan_observed_at")
+            if plan_observed_at is not None:
+                plan_observed_at = str(plan_observed_at).strip() or None
             observed_at = str(snapshot["observed_at"])
             windows = snapshot.get("windows")
             canonical_account_hash = _upsert_cpa_account(
@@ -2622,6 +2784,7 @@ def record_cpa_quota_batch(
                 plan=plan,
                 visible=True if current_native_generation else None,
                 now=now,
+                plan_observed_at=plan_observed_at,
             )
             account_key_hash = _snapshot_storage_hash(
                 "native_queue", canonical_account_hash, endpoint_revision
@@ -2689,17 +2852,40 @@ def record_cpa_quota_batch(
                 INSERT INTO cpa_quota_snapshots (
                     channel_id, account_key_hash, canonical_account_hash,
                     source_mode, endpoint_revision, public_id, account_display, plan,
-                    windows_json, visible, last_attempt_at, last_success_at,
-                    last_attempt_status, stale, error, quota_source, observed_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, 'native_queue', ?, ?, ?, ?, ?, 1, ?, ?,
+                    plan_observed_at, windows_json, visible, last_attempt_at,
+                    last_success_at, last_attempt_status, stale, error, quota_source,
+                    observed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, 'native_queue', ?, ?, ?, ?, ?, ?, 1, ?, ?,
                     'success', 0, NULL, 'usage_queue', ?, ?, ?)
                 ON CONFLICT(channel_id, account_key_hash) DO UPDATE SET
                     canonical_account_hash = excluded.canonical_account_hash,
                     source_mode = 'native_queue',
                     endpoint_revision = excluded.endpoint_revision,
                     account_display = excluded.account_display,
-                    plan = excluded.plan,
+                    plan = CASE
+                        WHEN excluded.plan = '未知套餐'
+                            THEN cpa_quota_snapshots.plan
+                        WHEN cpa_quota_snapshots.plan = '未知套餐'
+                            THEN excluded.plan
+                        WHEN excluded.plan_observed_at IS NULL
+                            THEN cpa_quota_snapshots.plan
+                        WHEN cpa_quota_snapshots.plan_observed_at IS NULL
+                            OR excluded.plan_observed_at >= cpa_quota_snapshots.plan_observed_at
+                        THEN excluded.plan
+                        ELSE cpa_quota_snapshots.plan
+                    END,
+                    plan_observed_at = CASE
+                        WHEN excluded.plan_observed_at IS NOT NULL
+                            AND excluded.plan != '未知套餐'
+                            AND (
+                                cpa_quota_snapshots.plan = '未知套餐'
+                                OR cpa_quota_snapshots.plan_observed_at IS NULL
+                                OR excluded.plan_observed_at
+                                    >= cpa_quota_snapshots.plan_observed_at
+                            )
+                        THEN excluded.plan_observed_at
+                        ELSE cpa_quota_snapshots.plan_observed_at
+                    END,
                     windows_json = excluded.windows_json,
                     visible = 1,
                     last_attempt_at = excluded.last_attempt_at,
@@ -2719,6 +2905,7 @@ def record_cpa_quota_batch(
                     public_id,
                     account_display,
                     plan,
+                    plan_observed_at,
                     json.dumps(windows if isinstance(windows, list) else [], ensure_ascii=False),
                     now,
                     now,
@@ -2803,20 +2990,27 @@ def record_cpa_active_attempt(
     return public_id
 
 
-def list_cached_cpa_channels(*, enabled_only: bool = True) -> list[dict[str, Any]]:
+def list_cached_cpa_channels(
+    *, enabled_only: bool = True, include_credential_details: bool = False
+) -> list[dict[str, Any]]:
     where = "WHERE c.enabled = 1" if enabled_only else ""
+    credential_columns = (
+        ", a.auth_file_masked, a.auth_tag, a.provider, a.project_id_masked"
+        if include_credential_details
+        else ""
+    )
     with get_conn() as conn:
         channel_rows = conn.execute(
             f"SELECT * FROM cpa_channels c {where} ORDER BY c.created_at ASC"
         ).fetchall()
         account_rows = conn.execute(
-            """
+            f"""
             SELECT a.channel_id, a.public_id AS account_public_id,
                 a.account_display AS discovered_display,
                 a.plan AS discovered_plan,
                 s.account_display, s.plan, s.windows_json,
                 s.last_attempt_at, s.last_success_at, s.last_attempt_status,
-                s.stale, s.error, s.quota_source, s.observed_at
+                s.stale, s.error, s.quota_source, s.observed_at{credential_columns}
             FROM cpa_accounts a
             JOIN cpa_channels c ON c.id = a.channel_id
             LEFT JOIN cpa_quota_snapshots s
@@ -2852,6 +3046,11 @@ def list_cached_cpa_channels(*, enabled_only: bool = True) -> list[dict[str, Any
             item["observed_at"] = row["observed_at"]
         if not success:
             item["error"] = row["error"] or "等待当前来源的首次额度数据"
+        if include_credential_details:
+            item["auth_file_masked"] = row["auth_file_masked"] or ""
+            item["auth_tag"] = row["auth_tag"] or ""
+            item["provider"] = row["provider"] or "unknown"
+            item["project_id_masked"] = row["project_id_masked"] or ""
         snapshots_by_channel.setdefault(row["channel_id"], []).append(item)
 
     result: list[dict[str, Any]] = []
@@ -2896,10 +3095,14 @@ def list_cached_cpa_channels(*, enabled_only: bool = True) -> list[dict[str, Any
     return result
 
 
-def list_cached_cpamp_channels(*, enabled_only: bool = True) -> list[dict[str, Any]]:
+def list_cached_cpamp_channels(
+    *, enabled_only: bool = True, include_credential_details: bool = False
+) -> list[dict[str, Any]]:
     result = [
         item
-        for item in list_cached_cpa_channels(enabled_only=enabled_only)
+        for item in list_cached_cpa_channels(
+            enabled_only=enabled_only, include_credential_details=include_credential_details
+        )
         if item["quota_source"] == "cpamp_snapshot"
     ]
     if not enabled_only:

@@ -22,6 +22,7 @@ from .cpamp_quota import (
     CPAMPAccount,
     CPAMPAuthenticationError,
     CPAMPError,
+    CPAMPQuotaSnapshot,
     CPAMPQueryUnsupported,
     QUERY_BATCH_SIZE as CPAMP_QUERY_BATCH_SIZE,
     TIMEOUT as CPAMP_TIMEOUT,
@@ -29,6 +30,7 @@ from .cpamp_quota import (
     fetch_cpamp_header_snapshots,
     parse_cpamp_header_items,
     parse_cpamp_query_items,
+    parse_cpamp_signal_snapshot,
     query_cpamp_snapshots_batch,
 )
 from .ollama_quota import fetch_ollama_quota_for_account
@@ -99,6 +101,11 @@ def _cpamp_discovery_account(account: CPAMPAccount) -> db.CPAMPDiscoveryAccount:
         subject_hash=account.subject_hash,
         account_display=account.account_display,
         plan=account.plan,
+        plan_observed_at=account.plan_observed_at,
+        auth_file_masked=account.auth_file_masked,
+        auth_tag=account.auth_tag,
+        provider=account.provider,
+        project_id_masked=account.project_id_masked,
     )
 
 
@@ -117,6 +124,10 @@ def _cpa_discovery_account(account: CPAAuthAccount) -> db.CPADiscoveryAccount:
         subject_hash=account.subject_hash,
         account_display=account.account_display,
         plan=account.plan,
+        auth_file_masked=account.auth_file_masked,
+        auth_tag=account.auth_tag,
+        provider=account.provider,
+        project_id_masked=account.project_id_masked,
     )
 
 
@@ -132,6 +143,7 @@ def _stored_cpamp_accounts(channel_id: str) -> list[CPAMPAccount]:
             plan=account.plan,
             locator_hash=account.locator_hash,
             subject_hash=account.subject_hash,
+            plan_observed_at=account.plan_observed_at,
         )
         for index, account in enumerate(
             db.list_cpamp_snapshot_identities(channel_id)
@@ -699,88 +711,58 @@ async def collect_cpamp_channel(
                 )
 
             fallback_to_headers = not discovery_succeeded
-            if discovery_succeeded and accounts:
-                log_event(
-                    logger,
-                    logging.INFO,
-                    "cpamp_snapshot_sync_started",
-                    provider="cpa",
-                    quota_source="cpamp_snapshot",
-                    channel_id=channel.id,
-                    account_count=len(accounts),
-                    snapshot_source="quota_snapshots",
-                    **_run_fields(run_id),
-                )
-                for batch_index, start in enumerate(
-                    range(0, len(accounts), CPAMP_QUERY_BATCH_SIZE)
-                ):
-                    _require_lease(lease_check)
-                    batch = accounts[start : start + CPAMP_QUERY_BATCH_SIZE]
-                    try:
-                        items = await query_cpamp_snapshots_batch(
-                            channel, batch, client
-                        )
-                    except CPAMPQueryUnsupported:
-                        fallback_to_headers = True
-                        log_event(
-                            logger,
-                            logging.INFO,
-                            "cpamp_snapshot_fallback",
-                            provider="cpa",
-                            quota_source="cpamp_snapshot",
-                            channel_id=channel.id,
-                            snapshot_source="header_snapshots",
-                            reason="query_unsupported",
-                            **_run_fields(run_id),
-                        )
-                        break
-                    except CPAMPAuthenticationError:
-                        raise
-                    except Exception as exc:
-                        failure_count += len(batch)
-                        for account in batch:
-                            db.record_cpamp_quota_snapshot(
-                                channel.id,
-                                account.account_key_hash,
-                                account_display=account.account_display,
-                                plan=account.plan,
-                                success=False,
-                                error=_safe_cpamp_error(exc),
-                                quota_source="quota_snapshots",
-                                expected_collection_revision=channel.collection_revision,
-                                lease_name=lease_name,
-                                lease_owner_id=lease_owner_id,
-                            )
-                        log_event(
-                            logger,
-                            logging.WARNING,
-                            "cpamp_snapshot_batch_failed",
-                            provider="cpa",
-                            quota_source="cpamp_snapshot",
-                            channel_id=channel.id,
-                            batch_index=batch_index,
-                            account_count=len(batch),
-                            **safe_exception_fields(exc, "snapshot_batch_error"),
-                            **_run_fields(run_id),
-                        )
-                        continue
+            # M3: auth-files carry CPA's in-memory quota.signals, so accounts with
+            # a complete, timestamped signal snapshot are written directly. A
+            # plan-only/flag-only/truncated signal set is not a quota snapshot:
+            # send that account through the query/header fallback instead of
+            # persisting a successful snapshot with an empty windows list.
+            signal_snapshots: list[CPAMPQuotaSnapshot] = []
+            fallback_accounts: list[CPAMPAccount] = []
+            for account in accounts:
+                if not account.quota_signals:
+                    fallback_accounts.append(account)
+                    continue
+                try:
+                    snapshot = parse_cpamp_signal_snapshot(account)
+                except Exception:
+                    fallback_accounts.append(account)
+                    continue
+                signal_snapshots.append(snapshot)
 
+            if discovery_succeeded and accounts:
+                if signal_snapshots:
                     _require_lease(lease_check)
                     if _current_cpamp_channel(channel) is None:
                         return False
-                    snapshots = parse_cpamp_query_items(items, batch)
-                    for snapshot in snapshots:
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "cpamp_snapshot_sync_started",
+                        provider="cpa",
+                        quota_source="cpamp_snapshot",
+                        channel_id=channel.id,
+                        account_count=len(signal_snapshots),
+                        snapshot_source="auth_files",
+                        **_run_fields(run_id),
+                    )
+                    for snapshot in signal_snapshots:
                         _require_lease(lease_check)
+                        account = snapshot.account
                         result = db.record_cpamp_quota_snapshot(
                             channel.id,
-                            snapshot.account.account_key_hash,
-                            account_display=snapshot.account.account_display,
-                            plan=snapshot.plan,
+                            account.account_key_hash,
+                            account_display=account.account_display,
+                            plan=account.plan,
                             success=True,
                             windows=snapshot.windows,
                             quota_source=snapshot.source,
-                            observed_at=snapshot.observed_at,
+                            observed_at=snapshot.observed_at or None,
                             stale=snapshot.stale,
+                            plan_observed_at=(
+                                account.quota_observed_at
+                                if account.plan_from_signals and account.quota_observed_at
+                                else None
+                            ),
                             expected_collection_revision=channel.collection_revision,
                             lease_name=lease_name,
                             lease_owner_id=lease_owner_id,
@@ -804,14 +786,127 @@ async def collect_cpamp_channel(
                             fresh_snapshot_count += 1
                         if (
                             latest_observed_at is None
-                            or snapshot.observed_at > latest_observed_at
+                            or (snapshot.observed_at and snapshot.observed_at > latest_observed_at)
                         ):
-                            latest_observed_at = snapshot.observed_at
+                            latest_observed_at = snapshot.observed_at or latest_observed_at
                     successful_batches += 1
-                    snapshot_source = "quota_snapshots"
+                    snapshot_source = "auth_files"
+
+                if fallback_accounts:
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "cpamp_snapshot_sync_started",
+                        provider="cpa",
+                        quota_source="cpamp_snapshot",
+                        channel_id=channel.id,
+                        account_count=len(fallback_accounts),
+                        snapshot_source="quota_snapshots",
+                        **_run_fields(run_id),
+                    )
+                    for batch_index, start in enumerate(
+                        range(0, len(fallback_accounts), CPAMP_QUERY_BATCH_SIZE)
+                    ):
+                        _require_lease(lease_check)
+                        batch = fallback_accounts[start : start + CPAMP_QUERY_BATCH_SIZE]
+                        try:
+                            items = await query_cpamp_snapshots_batch(
+                                channel, batch, client
+                            )
+                        except CPAMPQueryUnsupported:
+                            fallback_to_headers = True
+                            log_event(
+                                logger,
+                                logging.INFO,
+                                "cpamp_snapshot_fallback",
+                                provider="cpa",
+                                quota_source="cpamp_snapshot",
+                                channel_id=channel.id,
+                                snapshot_source="header_snapshots",
+                                reason="query_unsupported",
+                                **_run_fields(run_id),
+                            )
+                            break
+                        except CPAMPAuthenticationError:
+                            raise
+                        except Exception as exc:
+                            failure_count += len(batch)
+                            for account in batch:
+                                db.record_cpamp_quota_snapshot(
+                                    channel.id,
+                                    account.account_key_hash,
+                                    account_display=account.account_display,
+                                    plan=account.plan,
+                                    success=False,
+                                    error=_safe_cpamp_error(exc),
+                                    quota_source="quota_snapshots",
+                                    expected_collection_revision=channel.collection_revision,
+                                    lease_name=lease_name,
+                                    lease_owner_id=lease_owner_id,
+                                )
+                            log_event(
+                                logger,
+                                logging.WARNING,
+                                "cpamp_snapshot_batch_failed",
+                                provider="cpa",
+                                quota_source="cpamp_snapshot",
+                                channel_id=channel.id,
+                                batch_index=batch_index,
+                                account_count=len(batch),
+                                **safe_exception_fields(exc, "snapshot_batch_error"),
+                                **_run_fields(run_id),
+                            )
+                            continue
+
+                        _require_lease(lease_check)
+                        if _current_cpamp_channel(channel) is None:
+                            return False
+                        snapshots = parse_cpamp_query_items(items, batch)
+                        for snapshot in snapshots:
+                            _require_lease(lease_check)
+                            result = db.record_cpamp_quota_snapshot(
+                                channel.id,
+                                snapshot.account.account_key_hash,
+                                account_display=snapshot.account.account_display,
+                                plan=snapshot.plan,
+                                success=True,
+                                windows=snapshot.windows,
+                                quota_source=snapshot.source,
+                                observed_at=snapshot.observed_at,
+                                stale=snapshot.stale,
+                                expected_collection_revision=channel.collection_revision,
+                                lease_name=lease_name,
+                                lease_owner_id=lease_owner_id,
+                            )
+                            if not result.applied:
+                                failure_count += 1
+                                log_event(
+                                    logger,
+                                    logging.WARNING,
+                                    "cpamp_snapshot_discarded",
+                                    provider="cpa",
+                                    quota_source="cpamp_snapshot",
+                                    channel_id=channel.id,
+                                    public_id=result.public_id,
+                                    reason=result.reason or "snapshot_not_applied",
+                                    **_run_fields(run_id),
+                                )
+                                continue
+                            success_count += 1
+                            if not snapshot.stale:
+                                fresh_snapshot_count += 1
+                            if (
+                                latest_observed_at is None
+                                or snapshot.observed_at > latest_observed_at
+                            ):
+                                latest_observed_at = snapshot.observed_at
+                        successful_batches += 1
+                        if snapshot_source is None:
+                            snapshot_source = "quota_snapshots"
             elif discovery_succeeded:
                 successful_batches += 1
-                snapshot_source = "quota_snapshots"
+                if snapshot_source is None:
+                    snapshot_source = "quota_snapshots"
 
             if fallback_to_headers:
                 _require_lease(lease_check)
@@ -821,7 +916,7 @@ async def collect_cpamp_channel(
                     return False
                 snapshots = parse_cpamp_header_items(
                     items,
-                    accounts,
+                    fallback_accounts,
                     allow_ephemeral_accounts=not discovery_succeeded,
                 )
                 discovered = [snapshot.account for snapshot in snapshots]
@@ -876,7 +971,8 @@ async def collect_cpamp_channel(
                     ):
                         latest_observed_at = snapshot.observed_at
                 successful_batches += 1
-                snapshot_source = "header_snapshots"
+                if snapshot_source is None:
+                    snapshot_source = "header_snapshots"
 
             if successful_batches == 0:
                 raise CPAMPError("CPAMP 快照同步没有成功批次")

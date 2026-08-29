@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 
-from .cpa_quota import map_cpa_plan, mask_cpa_account, parse_auth_files, parse_cpa_usage_payload
+from .cpa_queue import parse_codex_quota_signals
+from .cpa_quota import (
+    auth_tag_from_locator,
+    map_cpa_plan,
+    mask_auth_file_name,
+    mask_cpa_account,
+    parse_auth_files,
+    parse_cpa_usage_payload,
+)
 from .db import CPAMPChannelRow
 from .quota import LABEL_MONTHLY, LABEL_ROLLING, LABEL_WEEKLY
 from .secrets import keyed_fingerprint
@@ -45,6 +53,16 @@ class CPAMPAccount:
     subject_hash: str = ""
     header_subject_hash: str = ""
     legacy_account_key_hashes: tuple[str, ...] = ()
+    quota_observed_at: str = ""
+    quota_signals: dict[str, str] = field(default_factory=dict)
+    plan_from_signals: bool = False
+    plan_observed_at: str | None = None
+    # M6: masked credential/account display fields, passed through from the
+    # CPAAuthAccount discovery or derived from header-snapshot identity.
+    auth_file_masked: str = ""
+    auth_tag: str = ""
+    provider: str = "unknown"
+    project_id_masked: str = ""
 
 
 @dataclass(frozen=True)
@@ -161,6 +179,8 @@ def _account_from_parts(
         locator_hash=locator_hash,
         subject_hash=_subject_hash(account_snapshot),
         header_subject_hash=_header_subject_hash(account_snapshot),
+        auth_file_masked=mask_auth_file_name(auth_file_name),
+        auth_tag=auth_tag_from_locator(locator_hash),
     )
 
 
@@ -185,6 +205,7 @@ def parse_cpamp_auth_files(payload: Any) -> list[CPAMPAccount]:
         account_snapshot = _text(
             raw, "account", "email", "display_account", "displayAccount"
         )
+        plan_from_signals = bool(item.quota_signals.get("x-codex-plan-type"))
         accounts.append(
             CPAMPAccount(
                 row_key=f"account-{index}",
@@ -201,9 +222,65 @@ def parse_cpamp_auth_files(payload: Any) -> list[CPAMPAccount]:
                     keyed_fingerprint("cpamp-account-v2", item.account_key_hash),
                     legacy_hash,
                 ),
+                quota_observed_at=item.quota_observed_at,
+                quota_signals=item.quota_signals,
+                plan_from_signals=plan_from_signals,
+                plan_observed_at=(
+                    item.quota_observed_at
+                    if plan_from_signals and item.quota_observed_at
+                    else None
+                ),
+                auth_file_masked=item.auth_file_masked,
+                auth_tag=item.auth_tag,
+                provider=item.provider,
+                project_id_masked=item.project_id_masked,
             )
         )
     return accounts
+
+
+def _observation_is_stale(
+    observed_at: str, *, now: datetime | None = None
+) -> bool:
+    """Mark an auth-files observation stale by age only.
+
+    Reuses HEADER_SNAPSHOT_MAX_AGE (6h) and HEADER_SNAPSHOT_FUTURE_TOLERANCE
+    (5 min). An unparseable observed_at is treated as not stale because this
+    helper only answers the age question; the signal parser rejects it before
+    writing a direct snapshot.
+    """
+    current = now or datetime.now(UTC)
+    observed = _timestamp(observed_at)
+    if observed is None:
+        return False
+    age = current - observed
+    return age > HEADER_SNAPSHOT_MAX_AGE or age < -HEADER_SNAPSHOT_FUTURE_TOLERANCE
+
+
+def parse_cpamp_signal_snapshot(
+    account: CPAMPAccount, *, now: datetime | None = None
+) -> CPAMPQuotaSnapshot:
+    """Build a realtime quota snapshot from an auth-files account's quota.signals.
+
+    This is the M3 main path: auth-files already carry CPA's in-memory quota
+    observation, so we parse the signals here instead of round-tripping through
+    Manager Server's ``quota-snapshots/query``.
+    """
+    observed = _timestamp(account.quota_observed_at)
+    if observed is None:
+        raise CPAMPError("CPAMP auth-files 额度观测时间无效")
+    observed_at = observed.isoformat().replace("+00:00", "Z")
+    windows = parse_codex_quota_signals(account.quota_signals, observed_at)
+    if not windows:
+        raise CPAMPError("CPAMP auth-files 缺少完整额度窗口")
+    return CPAMPQuotaSnapshot(
+        account=account,
+        plan=account.plan,
+        windows=windows,
+        observed_at=observed_at,
+        stale=_observation_is_stale(observed_at, now=now),
+        source="auth_files",
+    )
 
 
 async def discover_cpamp_accounts(

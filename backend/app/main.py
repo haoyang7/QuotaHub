@@ -29,12 +29,22 @@ from .analytics import build_overview
 from .config import load_service_config, mask_cookie, mask_ollama_cookie, update_service_config
 from .cpa_quota import normalize_cpa_url
 from .cpa_queue import (
+    CPA_QUEUE_LEASE_NAME,
     cpa_usage_queue_loop,
     invalidate_cpa_account_cache,
     wake_cpa_usage_queue,
 )
 from .opencode_usage import resolve_account_workspace_id
-from .quota_sync import quota_sync_loop, wake_quota_sync
+from .quota_sync import (
+    QUOTA_LEASE_NAME,
+    QuotaCollectionInterrupted,
+    collect_cpamp_channel,
+    collect_cpa_channel,
+    collect_ollama_account,
+    collect_opencode_account,
+    quota_sync_loop,
+    wake_quota_sync,
+)
 from .logging_config import configure_logging, get_logger, log_event, safe_exception_fields
 from .scheduler import SchedulerLease
 from .schemas import (
@@ -57,6 +67,7 @@ _sync_task: asyncio.Task[None] | None = None
 _quota_task: asyncio.Task[None] | None = None
 _cpa_queue_task: asyncio.Task[None] | None = None
 _usage_sync_lock = asyncio.Lock()
+_quota_refresh_lock = asyncio.Lock()
 USAGE_SYNC_LEASE_NAME = "usage-record-sync"
 logger = get_logger("main")
 
@@ -348,7 +359,9 @@ def _admin_cpa_channel_dict(channel_id: str) -> dict[str, Any]:
     channel = next(
         (
             item
-            for item in db.list_cached_cpa_channels(enabled_only=False)
+            for item in db.list_cached_cpa_channels(
+                enabled_only=False, include_credential_details=True
+            )
             if item.get("id") == channel_id
         ),
         None,
@@ -703,6 +716,74 @@ async def usage_backfill(
             await lease.release()
 
 
+@accounts_router.post(
+    "/opencode/{account_id}/refresh", dependencies=[Depends(require_csrf)]
+)
+async def refresh_opencode_quota(account_id: str) -> dict[str, Any]:
+    if _quota_refresh_lock.locked():
+        raise HTTPException(status_code=409, detail="额度采集正在进行，请稍后")
+    async with _quota_refresh_lock:
+        lease = SchedulerLease(QUOTA_LEASE_NAME, owner_id=str(uuid.uuid4()))
+        if not await lease.acquire():
+            raise HTTPException(status_code=409, detail="额度采集正在进行，请稍后")
+        started_at = time.monotonic()
+        try:
+            row = db.get_opencode_account(account_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail="账号不存在")
+            success = await collect_opencode_account(
+                row,
+                lease_check=lease.is_valid,
+                lease_name=QUOTA_LEASE_NAME,
+                lease_owner_id=lease.owner_id,
+            )
+            log_event(
+                logger,
+                logging.INFO if success else logging.WARNING,
+                "admin_quota_refresh_completed",
+                provider="opencode",
+                account_id=account_id,
+                result="success" if success else "failed",
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+            )
+            if not success:
+                raise HTTPException(status_code=502, detail="额度采集失败")
+            cached = db.get_cached_opencode_quota(account_id)
+            return cached or {
+                "account_id": account_id,
+                "name": row.name,
+                "success": False,
+                "updated_at": "",
+                "error": "等待首次采集",
+                "windows": [],
+            }
+        except HTTPException:
+            raise
+        except QuotaCollectionInterrupted as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "admin_quota_refresh_failed",
+                provider="opencode",
+                account_id=account_id,
+                reason="lease_lost",
+                **safe_exception_fields(exc, "lease_lost"),
+            )
+            raise HTTPException(status_code=409, detail="额度采集租约已失效") from exc
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "admin_quota_refresh_failed",
+                provider="opencode",
+                account_id=account_id,
+                **safe_exception_fields(exc, "quota_refresh_error"),
+            )
+            raise HTTPException(status_code=502, detail="额度采集失败") from exc
+        finally:
+            await lease.release()
+
+
 @accounts_router.get("/ollama")
 async def list_ollama_accounts() -> list[dict[str, Any]]:
     return [_ollama_account_dict(row) for row in db.list_ollama_accounts()]
@@ -782,6 +863,74 @@ async def delete_ollama_account(account_id: str) -> dict[str, bool]:
     return {"ok": True}
 
 
+@accounts_router.post(
+    "/ollama/{account_id}/refresh", dependencies=[Depends(require_csrf)]
+)
+async def refresh_ollama_quota(account_id: str) -> dict[str, Any]:
+    if _quota_refresh_lock.locked():
+        raise HTTPException(status_code=409, detail="额度采集正在进行，请稍后")
+    async with _quota_refresh_lock:
+        lease = SchedulerLease(QUOTA_LEASE_NAME, owner_id=str(uuid.uuid4()))
+        if not await lease.acquire():
+            raise HTTPException(status_code=409, detail="额度采集正在进行，请稍后")
+        started_at = time.monotonic()
+        try:
+            row = db.get_ollama_account(account_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail="账号不存在")
+            success = await collect_ollama_account(
+                row,
+                lease_check=lease.is_valid,
+                lease_name=QUOTA_LEASE_NAME,
+                lease_owner_id=lease.owner_id,
+            )
+            log_event(
+                logger,
+                logging.INFO if success else logging.WARNING,
+                "admin_quota_refresh_completed",
+                provider="ollama",
+                account_id=account_id,
+                result="success" if success else "failed",
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+            )
+            if not success:
+                raise HTTPException(status_code=502, detail="额度采集失败")
+            cached = db.get_cached_ollama_quota(account_id)
+            return cached or {
+                "account_id": account_id,
+                "name": row.name,
+                "success": False,
+                "updated_at": "",
+                "error": "等待首次采集",
+                "windows": [],
+            }
+        except HTTPException:
+            raise
+        except QuotaCollectionInterrupted as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "admin_quota_refresh_failed",
+                provider="ollama",
+                account_id=account_id,
+                reason="lease_lost",
+                **safe_exception_fields(exc, "lease_lost"),
+            )
+            raise HTTPException(status_code=409, detail="额度采集租约已失效") from exc
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "admin_quota_refresh_failed",
+                provider="ollama",
+                account_id=account_id,
+                **safe_exception_fields(exc, "quota_refresh_error"),
+            )
+            raise HTTPException(status_code=502, detail="额度采集失败") from exc
+        finally:
+            await lease.release()
+
+
 @auth_router.post("/login")
 async def admin_login(body: AdminLogin, request: Request, response: Response) -> dict[str, Any]:
     ensure_bootstrapped()
@@ -841,7 +990,7 @@ async def admin_logout(
 
 @cpa_router.get("/channels")
 async def list_cpa_channels() -> list[dict[str, Any]]:
-    return db.list_cached_cpa_channels(enabled_only=False)
+    return db.list_cached_cpa_channels(enabled_only=False, include_credential_details=True)
 
 
 @cpa_router.post("/channels", dependencies=[Depends(require_csrf)])
@@ -1061,6 +1210,92 @@ async def delete_cpa_channel(channel_id: str) -> dict[str, bool]:
         channel_id=channel_id,
     )
     return {"ok": True}
+
+
+@cpa_router.post(
+    "/channels/{channel_id}/refresh", dependencies=[Depends(require_csrf)]
+)
+async def refresh_cpa_channel(channel_id: str) -> dict[str, Any]:
+    channel = db.get_cpa_channel(channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="CPA 渠道不存在")
+    quota_source = channel.quota_source
+    if quota_source == "native_queue":
+        if not channel.exclusive_confirmed_at:
+            raise HTTPException(
+                status_code=409, detail="未确认独占消费，无法刷新"
+            )
+        lease_name = CPA_QUEUE_LEASE_NAME
+    else:
+        lease_name = QUOTA_LEASE_NAME
+    if _quota_refresh_lock.locked():
+        raise HTTPException(status_code=409, detail="额度采集正在进行，请稍后")
+    async with _quota_refresh_lock:
+        lease = SchedulerLease(lease_name, owner_id=str(uuid.uuid4()))
+        if not await lease.acquire():
+            raise HTTPException(status_code=409, detail="额度采集正在进行，请稍后")
+        started_at = time.monotonic()
+        try:
+            if quota_source == "cpamp_snapshot":
+                cpamp = db.get_cpamp_channel(channel_id)
+                if cpamp is None:
+                    raise HTTPException(status_code=404, detail="CPA 渠道不存在")
+                success = await collect_cpamp_channel(
+                    cpamp,
+                    lease_check=lease.is_valid,
+                    lease_name=lease_name,
+                    lease_owner_id=lease.owner_id,
+                )
+            else:
+                fresh = db.get_cpa_channel(channel_id)
+                if fresh is None:
+                    raise HTTPException(status_code=404, detail="CPA 渠道不存在")
+                success = await collect_cpa_channel(
+                    fresh,
+                    lease_check=lease.is_valid,
+                    lease_name=lease_name,
+                    lease_owner_id=lease.owner_id,
+                )
+            log_event(
+                logger,
+                logging.INFO if success else logging.WARNING,
+                "admin_quota_refresh_completed",
+                provider="cpa",
+                channel_id=channel_id,
+                quota_source=quota_source,
+                result="success" if success else "failed",
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+            )
+            if not success:
+                raise HTTPException(status_code=502, detail="额度采集失败")
+            return _admin_cpa_channel_dict(channel_id)
+        except HTTPException:
+            raise
+        except QuotaCollectionInterrupted as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "admin_quota_refresh_failed",
+                provider="cpa",
+                channel_id=channel_id,
+                quota_source=quota_source,
+                reason="lease_lost",
+                **safe_exception_fields(exc, "lease_lost"),
+            )
+            raise HTTPException(status_code=409, detail="额度采集租约已失效") from exc
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "admin_quota_refresh_failed",
+                provider="cpa",
+                channel_id=channel_id,
+                quota_source=quota_source,
+                **safe_exception_fields(exc, "quota_refresh_error"),
+            )
+            raise HTTPException(status_code=502, detail="额度采集失败") from exc
+        finally:
+            await lease.release()
 
 
 app.include_router(auth_router)

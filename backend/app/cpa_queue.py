@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import time
 import uuid
@@ -119,7 +120,10 @@ def _header_values(raw: Any) -> dict[str, str]:
         if not isinstance(key, str):
             continue
         values = value if isinstance(value, list) else [value]
-        for item in values:
+        # HTTP header collections use the last value as the effective value.
+        # Keep the same rule for auth-files signal arrays while still ignoring
+        # malformed entries.
+        for item in reversed(values):
             if isinstance(item, (str, int, float)) and not isinstance(item, bool):
                 text = str(item).strip()
                 if text:
@@ -135,6 +139,19 @@ def _number(value: Any) -> float | None:
         return float(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _boolean(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "allowed"}:
+        return True
+    if normalized in {"false", "0", "no", "rejected"}:
+        return False
+    return None
 
 
 def _timestamp(value: Any) -> datetime | None:
@@ -173,10 +190,13 @@ def _window_label(kind: str, duration_sec: int | None) -> str:
 
 
 def _parse_window(
-    headers: dict[str, str], kind: str, observed: datetime
+    headers: dict[str, str], prefix: str, kind: str, observed: datetime
 ) -> dict[str, Any] | None:
-    prefix = f"x-codex-{kind}-"
     used = _number(headers.get(prefix + "used-percent"))
+    if used is None:
+        remaining = _number(headers.get(prefix + "remaining-percent"))
+        if remaining is not None:
+            used = 100.0 - remaining
     if used is None:
         return None
     used = max(0.0, min(100.0, used))
@@ -191,6 +211,7 @@ def _parse_window(
         reset_at = observed + timedelta(seconds=reset_in_sec)
     if reset_at is not None and not reset_in_sec:
         reset_in_sec = max(0, int((reset_at - observed).total_seconds()))
+    quota_prefix = prefix[: -(len(kind) + 1)]
     window: dict[str, Any] = {
         "label": _window_label(kind, duration_sec),
         "used": round(used, 2),
@@ -202,9 +223,96 @@ def _parse_window(
         ),
         "reset_in_sec": reset_in_sec,
     }
+    allowed = _boolean(headers.get(quota_prefix + "allowed"))
+    limit_reached = _boolean(headers.get(quota_prefix + "limit-reached"))
+    if allowed is not None:
+        window["allowed"] = allowed
+    if limit_reached is not None:
+        window["limit_reached"] = limit_reached
     if duration_sec is not None:
         window["duration_sec"] = duration_sec
     return window
+
+
+_SIGNAL_WINDOW_KEY = re.compile(
+    r"^x-codex-(?P<ns>.*-)?(?P<kind>primary|secondary)-used-percent$"
+)
+
+
+def _active_limit_names(value: str) -> set[str]:
+    raw = value.strip().lower().strip("-")
+    if not raw:
+        return set()
+    candidates = {raw}
+    for prefix in ("x-codex-", "codex-", "codex_"):
+        if raw.startswith(prefix):
+            candidates.add(raw[len(prefix) :].strip("-"))
+    normalized = {candidate.replace("_", "-").strip("-") for candidate in candidates}
+    normalized.update(
+        f"additional-{candidate}" for candidate in tuple(normalized) if candidate
+    )
+    return normalized
+
+
+def parse_codex_quota_signals(
+    headers: dict[str, str], observed_at: str
+) -> list[dict[str, Any]]:
+    """Parse realtime quota windows from auth-files `quota.signals`.
+
+    Enumerates every `x-codex-(<ns>-)?(primary|secondary)-used-percent` key;
+    the namespace segment is upstream-controlled and must not be enumerated.
+    Windows are labelled by duration only, never by namespace name. When two
+    windows share a label the base namespace wins, then the namespace named by
+    `x-codex-active-limit`, then lexicographic order for determinism.
+    """
+    normalized = _header_values(headers)
+    observed = _timestamp(observed_at)
+    if observed is None:
+        return []
+    active_raw = normalized.get("x-codex-active-limit")
+    active_names = _active_limit_names(active_raw) if active_raw else set()
+    candidates: list[tuple[tuple[int, int, str, int], dict[str, Any]]] = []
+    for key in normalized:
+        match = _SIGNAL_WINDOW_KEY.match(key)
+        if match is None:
+            continue
+        ns = match.group("ns") or ""
+        kind = match.group("kind")
+        if ns.startswith("code-review-"):
+            # Code-review limits are a separate feature, not account quota.
+            continue
+        prefix = f"x-codex-{ns}{kind}-"
+        window_minutes = _number(normalized.get(prefix + "window-minutes"))
+        if window_minutes is None or window_minutes <= 0:
+            # Truncated signal set: never emit a half-baked window.
+            continue
+        reset_after = _number(normalized.get(prefix + "reset-after-seconds"))
+        reset_at = _timestamp(normalized.get(prefix + "reset-at"))
+        if reset_after is not None and reset_after < 0:
+            continue
+        if reset_after is None and reset_at is None:
+            continue
+        window = _parse_window(normalized, prefix, kind, observed)
+        if window is None:
+            continue
+        priority = (
+            0 if not ns else 1,
+            0 if ns.rstrip("-") in active_names else 1,
+            ns,
+            0 if kind == "primary" else 1,
+        )
+        candidates.append((priority, window))
+    if not candidates:
+        return []
+    by_label: dict[str, dict[str, Any]] = {}
+    for _priority, window in sorted(candidates, key=lambda item: item[0]):
+        label = str(window.get("label"))
+        if label not in by_label:
+            by_label[label] = window
+    windows = list(by_label.values())
+    order = {LABEL_ROLLING: 0, LABEL_WEEKLY: 1, LABEL_MONTHLY: 2}
+    windows.sort(key=lambda item: order.get(str(item.get("label")), 99))
+    return windows
 
 
 def parse_cpa_usage_queue_event(payload: Any) -> CPAQueueObservation | None:
@@ -224,7 +332,12 @@ def parse_cpa_usage_queue_event(payload: Any) -> CPAQueueObservation | None:
     windows = [
         window
         for kind in ("primary", "secondary")
-        if (window := _parse_window(headers, kind, observed)) is not None
+        if (
+            window := _parse_window(
+                headers, f"x-codex-{kind}-", kind, observed
+            )
+        )
+        is not None
     ]
     if not windows:
         return None
@@ -472,7 +585,9 @@ async def collect_cpa_usage_queue_channel(
                 newest_event_at: str | None = None
                 batch_discarded = len(items) - len(observations)
                 batch_processed = 0
-                candidates: list[tuple[CPAQueueObservation, CPAAuthAccount, str]] = []
+                candidates: list[
+                    tuple[CPAQueueObservation, CPAAuthAccount, str, str | None]
+                ] = []
                 for observation in observations:
                     account = accounts.get(observation.auth_index)
                     if account is None:
@@ -483,7 +598,14 @@ async def collect_cpa_usage_queue_channel(
                         if observation.plan != "未知套餐"
                         else account.plan
                     )
-                    candidates.append((observation, account, plan))
+                    plan_observed_at = (
+                        observation.observed_at
+                        if observation.plan != "未知套餐"
+                        else None
+                    )
+                    candidates.append(
+                        (observation, account, plan, plan_observed_at)
+                    )
 
                 write_results: list[db.SnapshotWriteResult] = []
                 if candidates:
@@ -495,10 +617,11 @@ async def collect_cpa_usage_queue_channel(
                                     "account_key_hash": account.account_key_hash,
                                     "account_display": account.account_display,
                                     "plan": plan,
+                                    "plan_observed_at": plan_observed_at,
                                     "windows": observation.windows,
                                     "observed_at": observation.observed_at,
                                 }
-                                for observation, account, plan in candidates
+                                for observation, account, plan, plan_observed_at in candidates
                             ],
                         )
                     except db.CollectionGuardRejected:
@@ -532,7 +655,7 @@ async def collect_cpa_usage_queue_channel(
                         )
                         return processed_count, discarded_count
 
-                for (observation, _account, _plan), result in zip(
+                for (observation, _account, _plan, _plan_observed_at), result in zip(
                     candidates, write_results, strict=True
                 ):
                     if not result.applied:

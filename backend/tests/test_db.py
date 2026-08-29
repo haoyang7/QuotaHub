@@ -1,8 +1,9 @@
 import sqlite3
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from cryptography.fernet import Fernet
 
 from app import db
 from app.bootstrap import ensure_bootstrapped
@@ -1006,3 +1007,707 @@ def test_guarded_quota_write_rejects_expired_owner_lease(temp_data_dir):
         )
     assert exc_info.value.reason == "lease_lost"
     assert db.get_quota_snapshot_attempt("opencode", account.id) is None
+
+
+def _plan_ts(base: datetime, offset_seconds: int) -> str:
+    return (
+        (base + timedelta(seconds=offset_seconds))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def test_init_db_migrates_cpa_plan_observed_at_idempotently(temp_data_dir):
+    channel = db.create_cpa_channel(
+        name="Legacy CPA",
+        base_url="https://cpa.example.test",
+        management_key="secret",
+    )
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    with db.get_conn() as conn:
+        conn.execute("DROP TABLE cpa_accounts")
+        conn.execute("DROP TABLE cpa_quota_snapshots")
+        conn.execute(
+            """
+            CREATE TABLE cpa_accounts (
+                channel_id TEXT NOT NULL REFERENCES cpa_channels(id) ON DELETE CASCADE,
+                canonical_account_hash TEXT NOT NULL,
+                public_id TEXT NOT NULL UNIQUE,
+                account_display TEXT NOT NULL,
+                plan TEXT NOT NULL DEFAULT '未知套餐',
+                locator_hash TEXT,
+                subject_hash TEXT,
+                visible INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (channel_id, canonical_account_hash)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE cpa_quota_snapshots (
+                channel_id TEXT NOT NULL REFERENCES cpa_channels(id) ON DELETE CASCADE,
+                account_key_hash TEXT NOT NULL,
+                canonical_account_hash TEXT,
+                source_mode TEXT NOT NULL DEFAULT 'native_queue',
+                endpoint_revision INTEGER NOT NULL DEFAULT 1,
+                locator_hash TEXT,
+                subject_hash TEXT,
+                public_id TEXT NOT NULL UNIQUE,
+                account_display TEXT NOT NULL,
+                plan TEXT NOT NULL,
+                windows_json TEXT NOT NULL DEFAULT '[]',
+                visible INTEGER NOT NULL DEFAULT 1,
+                last_attempt_at TEXT,
+                last_success_at TEXT,
+                last_attempt_status TEXT,
+                stale INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                quota_source TEXT,
+                observed_at TEXT,
+                accept_observed_after TEXT,
+                last_active_attempt_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (channel_id, account_key_hash)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO cpa_accounts (
+                channel_id, canonical_account_hash, public_id, account_display,
+                plan, visible, created_at, updated_at
+            ) VALUES (?, 'hmac:v1:legacy-acct', 'legacy-acct-public',
+                'l***@example.test', 'Pro 20x', 1, ?, ?)
+            """,
+            (channel.id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO cpa_quota_snapshots (
+                channel_id, account_key_hash, canonical_account_hash, public_id,
+                account_display, plan, source_mode, last_success_at,
+                last_attempt_status, created_at, updated_at
+            ) VALUES (?, 'hmac:v1:legacy-acct', 'hmac:v1:legacy-acct',
+                'legacy-snap-public', 'l***@example.test', 'Pro 20x', 'native_queue',
+                ?, 'success', ?, ?)
+            """,
+            (channel.id, now, now, now),
+        )
+
+    db.init_db()
+    with db.get_conn() as conn:
+        acct_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(cpa_accounts)").fetchall()
+        }
+        snap_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(cpa_quota_snapshots)").fetchall()
+        }
+        assert "plan_observed_at" in acct_columns
+        assert "plan_observed_at" in snap_columns
+        acct = conn.execute(
+            "SELECT plan, plan_observed_at FROM cpa_accounts WHERE channel_id = ?",
+            (channel.id,),
+        ).fetchone()
+        snap = conn.execute(
+            """
+            SELECT plan, plan_observed_at FROM cpa_quota_snapshots
+            WHERE channel_id = ? AND source_mode = 'native_queue'
+            """,
+            (channel.id,),
+        ).fetchone()
+    assert acct["plan"] == "Pro 20x"
+    assert acct["plan_observed_at"] is None
+    assert snap["plan"] == "Pro 20x"
+    assert snap["plan_observed_at"] is None
+
+    # Idempotent: re-running init_db keeps the column set and the row data.
+    db.init_db()
+    with db.get_conn() as conn:
+        acct_columns_after = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(cpa_accounts)").fetchall()
+        }
+        snap_columns_after = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(cpa_quota_snapshots)").fetchall()
+        }
+        acct_after = conn.execute(
+            "SELECT plan, plan_observed_at FROM cpa_accounts WHERE channel_id = ?",
+            (channel.id,),
+        ).fetchone()
+    assert acct_columns_after == acct_columns
+    assert snap_columns_after == snap_columns
+    assert acct_after["plan"] == "Pro 20x"
+    assert acct_after["plan_observed_at"] is None
+
+
+def test_plan_arbitration_upgrade_from_weak_to_strong(temp_data_dir):
+    """Regression: account upgraded Plus -> Pro 20x must surface Pro 20x."""
+    cpa = db.create_cpa_channel(
+        name="CPA",
+        base_url="https://cpa.example.test",
+        management_key="secret",
+        quota_source="native_queue",
+        confirm_exclusive=True,
+    )
+    account_hash = "hmac:v1:cpa-account"
+    display = "a***@example.test"
+    base = datetime.now(UTC)
+    t0 = _plan_ts(base, -200)
+    t1 = _plan_ts(base, 0)
+
+    db.prepare_cpa_channel_discovery(
+        cpa.id,
+        [(account_hash, None, display, "Plus")],
+    )
+    db.record_cpa_quota_snapshot(
+        cpa.id,
+        account_hash,
+        account_display=display,
+        plan="Plus",
+        success=True,
+        windows=[{"label": "5h Rolling", "remaining": 80}],
+        observed_at=t0,
+    )
+    db.prepare_cpa_channel_discovery(
+        cpa.id,
+        [
+            db.CPADiscoveryAccount(
+                account_key_hash=account_hash,
+                legacy_account_key_hashes=(),
+                locator_hash=account_hash,
+                subject_hash="",
+                account_display=display,
+                plan="Pro 20x",
+                plan_observed_at=t1,
+            )
+        ],
+    )
+    cached = db.list_cached_cpa_channels(enabled_only=False)[0]["accounts"]
+    assert cached[0]["plan"] == "Pro 20x"
+
+
+def test_quota_observed_at_does_not_become_plan_observed_at(temp_data_dir):
+    cpamp = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    observed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    db.record_cpamp_quota_snapshot(
+        cpamp.id,
+        "hmac:v1:cpamp-account",
+        account_display="a***@example.test",
+        plan="Plus",
+        success=True,
+        windows=[{"label": "5h Rolling", "remaining": 80}],
+        observed_at=observed_at,
+    )
+    with db.get_conn() as conn:
+        account = conn.execute(
+            "SELECT plan, plan_observed_at FROM cpa_accounts WHERE channel_id = ?",
+            (cpamp.id,),
+        ).fetchone()
+        snapshot = conn.execute(
+            "SELECT plan, plan_observed_at FROM cpa_quota_snapshots WHERE channel_id = ?",
+            (cpamp.id,),
+        ).fetchone()
+    assert account["plan"] == "Plus"
+    assert account["plan_observed_at"] is None
+    assert snapshot["plan"] == "Plus"
+    assert snapshot["plan_observed_at"] is None
+
+
+def test_plan_arbitration_cpamp_upgrade_from_weak_to_strong(temp_data_dir):
+    """CPAMP path must also thread plan_observed_at through to the snapshot."""
+    cpamp = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    account_hash = "hmac:v1:cpamp-account"
+    display = "b***@example.test"
+    base = datetime.now(UTC)
+    t0 = _plan_ts(base, -200)
+    t1 = _plan_ts(base, 0)
+
+    db.prepare_cpamp_channel_discovery(
+        cpamp.id,
+        [(account_hash, None, display, "Plus")],
+    )
+    db.record_cpamp_quota_snapshot(
+        cpamp.id,
+        account_hash,
+        account_display=display,
+        plan="Plus",
+        success=True,
+        windows=[{"label": "5h Rolling", "remaining": 80}],
+        observed_at=t0,
+    )
+    db.prepare_cpamp_channel_discovery(
+        cpamp.id,
+        [
+            db.CPAMPDiscoveryAccount(
+                account_key_hash=account_hash,
+                legacy_account_key_hashes=(),
+                locator_hash=account_hash,
+                subject_hash="",
+                account_display=display,
+                plan="Pro 20x",
+                plan_observed_at=t1,
+            )
+        ],
+    )
+    cached = db.list_cached_cpamp_channels(enabled_only=False)[0]["accounts"]
+    assert cached[0]["plan"] == "Pro 20x"
+
+
+def test_plan_arbitration_weak_snapshot_keeps_strong_plan(temp_data_dir):
+    """A weak-source snapshot (no observed time) must not overwrite a known plan."""
+    cpa = db.create_cpa_channel(
+        name="CPA",
+        base_url="https://cpa.example.test",
+        management_key="secret",
+        quota_source="native_queue",
+        confirm_exclusive=True,
+    )
+    account_hash = "hmac:v1:cpa-account"
+    display = "a***@example.test"
+    t1 = _plan_ts(datetime.now(UTC), 0)
+
+    db.record_cpa_quota_snapshot(
+        cpa.id,
+        account_hash,
+        account_display=display,
+        plan="Pro 20x",
+        success=True,
+        windows=[],
+        observed_at=t1,
+        plan_observed_at=t1,
+    )
+    # Weak source: neither observed_at nor plan_observed_at provided.
+    db.record_cpa_quota_snapshot(
+        cpa.id,
+        account_hash,
+        account_display=display,
+        plan="Plus",
+        success=True,
+        windows=[],
+    )
+    cached = db.list_cached_cpa_channels(enabled_only=False)[0]["accounts"]
+    assert cached[0]["plan"] == "Pro 20x"
+    with db.get_conn() as conn:
+        snap = conn.execute(
+            "SELECT plan, plan_observed_at FROM cpa_quota_snapshots WHERE channel_id = ?",
+            (cpa.id,),
+        ).fetchone()
+    assert snap["plan"] == "Pro 20x"
+    assert snap["plan_observed_at"] == t1
+
+
+def test_plan_arbitration_older_strong_source_keeps_newer_plan(temp_data_dir):
+    """An older strong observation must not overwrite a newer known plan."""
+    cpa = db.create_cpa_channel(
+        name="CPA",
+        base_url="https://cpa.example.test",
+        management_key="secret",
+        quota_source="native_queue",
+        confirm_exclusive=True,
+    )
+    account_hash = "hmac:v1:cpa-account"
+    display = "a***@example.test"
+    base = datetime.now(UTC)
+    t0 = _plan_ts(base, -100)
+    t1 = _plan_ts(base, 0)
+
+    db.record_cpa_quota_snapshot(
+        cpa.id,
+        account_hash,
+        account_display=display,
+        plan="Pro 20x",
+        success=True,
+        windows=[],
+        observed_at=t1,
+        plan_observed_at=t1,
+    )
+    db.prepare_cpa_channel_discovery(
+        cpa.id,
+        [
+            db.CPADiscoveryAccount(
+                account_key_hash=account_hash,
+                legacy_account_key_hashes=(),
+                locator_hash=account_hash,
+                subject_hash="",
+                account_display=display,
+                plan="Pro 5x",
+                plan_observed_at=t0,
+            )
+        ],
+    )
+    cached = db.list_cached_cpa_channels(enabled_only=False)[0]["accounts"]
+    assert cached[0]["plan"] == "Pro 20x"
+
+
+def test_plan_arbitration_weak_discovery_fills_plan_before_snapshot(temp_data_dir):
+    """Weak discovery alone is enough to surface a plan before any quota success."""
+    cpa = db.create_cpa_channel(
+        name="CPA",
+        base_url="https://cpa.example.test",
+        management_key="secret",
+        quota_source="native_queue",
+        confirm_exclusive=True,
+    )
+    account_hash = "hmac:v1:cpa-account"
+    display = "a***@example.test"
+    db.prepare_cpa_channel_discovery(
+        cpa.id,
+        [(account_hash, None, display, "Plus")],
+    )
+    cached = db.list_cached_cpa_channels(enabled_only=False)[0]["accounts"]
+    assert cached[0]["plan"] == "Plus"
+
+
+def test_plan_arbitration_strong_source_overwrites_null_observed_at(temp_data_dir):
+    """Legacy rows (plan_observed_at NULL) accept a strong-source upgrade."""
+    cpa = db.create_cpa_channel(
+        name="CPA",
+        base_url="https://cpa.example.test",
+        management_key="secret",
+        quota_source="native_queue",
+        confirm_exclusive=True,
+    )
+    account_hash = "hmac:v1:cpa-account"
+    display = "a***@example.test"
+    t1 = _plan_ts(datetime.now(UTC), 0)
+
+    # Legacy row: plan set but plan_observed_at NULL (no observed_at passed).
+    db.record_cpa_quota_snapshot(
+        cpa.id,
+        account_hash,
+        account_display=display,
+        plan="Pro 5x",
+        success=True,
+        windows=[],
+    )
+    db.prepare_cpa_channel_discovery(
+        cpa.id,
+        [
+            db.CPADiscoveryAccount(
+                account_key_hash=account_hash,
+                legacy_account_key_hashes=(),
+                locator_hash=account_hash,
+                subject_hash="",
+                account_display=display,
+                plan="Pro 20x",
+                plan_observed_at=t1,
+            )
+        ],
+    )
+    cached = db.list_cached_cpa_channels(enabled_only=False)[0]["accounts"]
+    assert cached[0]["plan"] == "Pro 20x"
+
+
+def test_plan_arbitration_unknown_strong_source_does_not_downgrade(temp_data_dir):
+    """A strong source carrying 未知套餐 must never downgrade a known plan."""
+    cpa = db.create_cpa_channel(
+        name="CPA",
+        base_url="https://cpa.example.test",
+        management_key="secret",
+        quota_source="native_queue",
+        confirm_exclusive=True,
+    )
+    account_hash = "hmac:v1:cpa-account"
+    display = "a***@example.test"
+    base = datetime.now(UTC)
+    t1 = _plan_ts(base, 0)
+    t2 = _plan_ts(base, 100)
+
+    db.record_cpa_quota_snapshot(
+        cpa.id,
+        account_hash,
+        account_display=display,
+        plan="Pro 20x",
+        success=True,
+        windows=[],
+        observed_at=t1,
+        plan_observed_at=t1,
+    )
+    db.prepare_cpa_channel_discovery(
+        cpa.id,
+        [
+            db.CPADiscoveryAccount(
+                account_key_hash=account_hash,
+                legacy_account_key_hashes=(),
+                locator_hash=account_hash,
+                subject_hash="",
+                account_display=display,
+                plan="未知套餐",
+                plan_observed_at=t2,
+            )
+        ],
+    )
+    cached = db.list_cached_cpa_channels(enabled_only=False)[0]["accounts"]
+    assert cached[0]["plan"] == "Pro 20x"
+    with db.get_conn() as conn:
+        snap = conn.execute(
+            "SELECT plan, plan_observed_at FROM cpa_quota_snapshots WHERE channel_id = ?",
+            (cpa.id,),
+        ).fetchone()
+        acct = conn.execute(
+            "SELECT plan, plan_observed_at FROM cpa_accounts WHERE channel_id = ?",
+            (cpa.id,),
+        ).fetchone()
+    assert snap["plan"] == "Pro 20x"
+    assert snap["plan_observed_at"] == t1
+    assert acct["plan"] == "Pro 20x"
+    assert acct["plan_observed_at"] == t1
+
+
+def test_list_cpamp_snapshot_identities_backfills_strong_plan_observed_at(
+    temp_data_dir,
+):
+    """list_cpamp_snapshot_identities must thread plan_observed_at so the
+    discovery-failure fallback rediscovery keeps treating a strong-source plan
+    as strong instead of collapsing it to a weak id_token plan."""
+    cpamp = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    account_hash = "hmac:v1:cpamp-account"
+    display = "b***@example.test"
+    t1 = _plan_ts(datetime.now(UTC), 0)
+    db.prepare_cpamp_channel_discovery(
+        cpamp.id, [(account_hash, None, display, "Plus")]
+    )
+    db.record_cpamp_quota_snapshot(
+        cpamp.id,
+        account_hash,
+        account_display=display,
+        plan="Pro 20x",
+        success=True,
+        windows=[{"label": "5h Rolling", "remaining": 80}],
+        observed_at=t1,
+        plan_observed_at=t1,
+    )
+    identities = db.list_cpamp_snapshot_identities(cpamp.id)
+    assert len(identities) == 1
+    assert identities[0].plan == "Pro 20x"
+    assert identities[0].plan_observed_at == t1
+
+
+def test_stored_cpamp_account_rediscovery_threads_strong_plan_observed_at(
+    temp_data_dir,
+):
+    """The stored-account fallback + discovery conversion must carry
+    plan_observed_at end-to-end so rediscovery preserves the strong plan."""
+    from app.quota_sync import _cpamp_discovery_account, _stored_cpamp_accounts
+
+    cpamp = db.create_cpamp_channel(
+        name="CPAMP",
+        base_url="https://cpamp.example.test",
+        management_key="secret",
+    )
+    account_hash = "hmac:v1:cpamp-account"
+    display = "b***@example.test"
+    t1 = _plan_ts(datetime.now(UTC), 0)
+    db.prepare_cpamp_channel_discovery(
+        cpamp.id, [(account_hash, None, display, "Plus")]
+    )
+    db.record_cpamp_quota_snapshot(
+        cpamp.id,
+        account_hash,
+        account_display=display,
+        plan="Pro 20x",
+        success=True,
+        windows=[{"label": "5h Rolling", "remaining": 80}],
+        observed_at=t1,
+        plan_observed_at=t1,
+    )
+    stored = _stored_cpamp_accounts(cpamp.id)
+    assert len(stored) == 1
+    assert stored[0].plan == "Pro 20x"
+    assert stored[0].plan_observed_at == t1
+    rediscovery = _cpamp_discovery_account(stored[0])
+    assert rediscovery.plan == "Pro 20x"
+    assert rediscovery.plan_observed_at == t1
+
+
+def test_cpa_account_persists_masked_credentials_only(temp_data_dir):
+    channel = db.create_cpa_channel(
+        name="CPA",
+        base_url="https://cpa.example.test",
+        management_key="secret",
+        quota_source="native_queue",
+        confirm_exclusive=True,
+    )
+    raw_name = "codex-account-sensitive.json"
+    raw_project_id = "proj-secret-1234567890"
+    db.prepare_cpa_channel_discovery(
+        channel.id,
+        [
+            db.CPADiscoveryAccount(
+                account_key_hash="hmac:v1:cpa-account-1",
+                legacy_account_key_hashes=(),
+                locator_hash="hmac:v1:locator-1",
+                subject_hash="hmac:v1:subject-1",
+                account_display="a***@example.test",
+                plan="Plus",
+                auth_file_masked="co***e.json",
+                auth_tag="#a3f9c1",
+                provider="codex",
+                project_id_masked="pr***90",
+            )
+        ],
+        source_mode="native_queue",
+    )
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT auth_file_masked, auth_tag, provider, project_id_masked "
+            "FROM cpa_accounts WHERE channel_id = ?",
+            (channel.id,),
+        ).fetchone()
+        assert row["auth_file_masked"] == "co***e.json"
+        assert row["auth_tag"] == "#a3f9c1"
+        assert row["provider"] == "codex"
+        assert row["project_id_masked"] == "pr***90"
+        # Sentinel: cpa_accounts has no raw-identity columns.
+        cols = {col[1] for col in conn.execute("PRAGMA table_info(cpa_accounts)")}
+        assert "auth_index" not in cols
+        assert "note" not in cols
+        assert "label" not in cols
+        assert "file_name" not in cols
+        assert "status_message" not in cols
+        # Sentinel: raw values are not present in any stored text.
+        blob = conn.execute(
+            "SELECT auth_file_masked || '|' || auth_tag || '|' || provider || '|' || "
+            "project_id_masked || '|' || account_display || '|' || plan "
+            "FROM cpa_accounts WHERE channel_id = ?",
+            (channel.id,),
+        ).fetchone()[0]
+        assert raw_name not in blob
+        assert raw_project_id not in blob
+
+
+def test_list_cached_cpa_channels_credential_details_isolation(temp_data_dir):
+    channel = db.create_cpa_channel(
+        name="CPA",
+        base_url="https://cpa.example.test",
+        management_key="secret",
+        quota_source="native_queue",
+        confirm_exclusive=True,
+    )
+    db.prepare_cpa_channel_discovery(
+        channel.id,
+        [
+            db.CPADiscoveryAccount(
+                account_key_hash="hmac:v1:cpa-account-1",
+                legacy_account_key_hashes=(),
+                locator_hash="hmac:v1:locator-1",
+                subject_hash="hmac:v1:subject-1",
+                account_display="a***@example.test",
+                plan="Plus",
+                auth_file_masked="co***e.json",
+                auth_tag="#a3f9c1",
+                provider="codex",
+                project_id_masked="pr***90",
+            )
+        ],
+        source_mode="native_queue",
+    )
+    # Default (public) view: the four credential keys are entirely absent.
+    default_item = db.list_cached_cpa_channels(enabled_only=False)[0]["accounts"][0]
+    for key in ("auth_file_masked", "auth_tag", "provider", "project_id_masked"):
+        assert key not in default_item
+    # Admin view: the four keys are always present, with no raw identity.
+    admin_item = db.list_cached_cpa_channels(
+        enabled_only=False, include_credential_details=True
+    )[0]["accounts"][0]
+    assert admin_item["auth_file_masked"] == "co***e.json"
+    assert admin_item["auth_tag"] == "#a3f9c1"
+    assert admin_item["provider"] == "codex"
+    assert admin_item["project_id_masked"] == "pr***90"
+    for key in ("auth_file_name", "auth_index", "note", "label", "fileName"):
+        assert key not in admin_item
+
+
+def test_init_db_adds_credential_columns_to_legacy_cpa_accounts(
+    monkeypatch, tmp_path
+):
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setenv("QUOTAHUB_DATA", str(data))
+    monkeypatch.setenv(
+        "QUOTAHUB_ADMIN_TOKEN", "test-admin-token-with-at-least-32-characters"
+    )
+    monkeypatch.setenv(
+        "QUOTAHUB_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii")
+    )
+    # Build a legacy schema without the M6 credential columns.
+    with sqlite3.connect(data / "quotahub.db") as conn:
+        conn.execute(
+            """
+            CREATE TABLE cpa_channels (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL,
+                management_key TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+                collection_revision INTEGER NOT NULL DEFAULT 1,
+                interval_sec INTEGER NOT NULL DEFAULT 300, last_attempt_at TEXT,
+                last_success_at TEXT, last_attempt_status TEXT,
+                stale INTEGER NOT NULL DEFAULT 0, error TEXT,
+                public_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE cpa_accounts (
+                channel_id TEXT NOT NULL REFERENCES cpa_channels(id) ON DELETE CASCADE,
+                canonical_account_hash TEXT NOT NULL, public_id TEXT NOT NULL UNIQUE,
+                account_display TEXT NOT NULL,
+                plan TEXT NOT NULL DEFAULT '未知套餐',
+                plan_observed_at TEXT, locator_hash TEXT, subject_hash TEXT,
+                visible INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (channel_id, canonical_account_hash)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO cpa_channels (id, name, base_url, management_key, public_id, "
+            "created_at, updated_at) VALUES ('ch-1', 'CPA', 'https://x', 'k', 'pub-ch', "
+            "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO cpa_accounts (channel_id, canonical_account_hash, public_id, "
+            "account_display, plan, visible, created_at, updated_at) VALUES "
+            "('ch-1', 'hash-1', 'pub-1', 'legacy-display', 'Plus', 1, "
+            "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+    # init_db must idempotently add the four credential columns and keep the row.
+    db.init_db()
+    with sqlite3.connect(data / "quotahub.db") as conn:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(cpa_accounts)")}
+        assert {
+            "auth_file_masked",
+            "auth_tag",
+            "provider",
+            "project_id_masked",
+        } <= cols
+        row = conn.execute(
+            "SELECT account_display, plan, auth_file_masked, auth_tag, provider, "
+            "project_id_masked FROM cpa_accounts WHERE public_id = 'pub-1'"
+        ).fetchone()
+        assert row[0] == "legacy-display"  # legacy data preserved
+        assert row[1] == "Plus"  # legacy data preserved
+        assert row[2] is None  # new columns NULL for legacy rows
+        assert row[3] is None
+        assert row[4] is None
+        assert row[5] is None
+    # Re-running init_db is a no-op (idempotent migration).
+    db.init_db()

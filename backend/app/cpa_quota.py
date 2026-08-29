@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -38,6 +38,15 @@ class CPAAuthAccount:
     subject_hash: str = ""
     legacy_account_key_hash: str | None = None
     previous_account_key_hash: str | None = None
+    quota_observed_at: str = ""
+    quota_signals: dict[str, str] = field(default_factory=dict)
+    # M6: masked credential/account display fields. Only the masked values
+    # reach SQLite and the admin API; the raw ``auth_file_name`` above stays
+    # in-memory for identity mapping and never persists.
+    auth_file_masked: str = ""
+    auth_tag: str = ""
+    provider: str = "unknown"
+    project_id_masked: str = ""
 
 def normalize_cpa_url(value: str) -> str:
     raw = value.strip()
@@ -80,6 +89,56 @@ def mask_cpa_account(value: str) -> str:
     if len(text) <= 8:
         return f"{text[:1]}***{text[-1:]}"
     return f"{text[:2]}***{text[-2:]}"
+
+
+def mask_auth_file_name(name: str) -> str:
+    """Mask an auth-file name while preserving its extension.
+
+    ``codex-a.json`` -> ``co***a.json`` (stem > 4 chars), ``beta.json`` ->
+    ``b***.json`` (stem <= 4 chars), ``codex-beta`` (no extension) ->
+    ``mask_cpa_account`` applied to the whole string, empty -> ``""``.
+    """
+    text = (name or "").strip()
+    if not text:
+        return ""
+    dot = text.rfind(".")
+    if dot <= 0:
+        # No dot, or a leading dot with an empty stem: treat as extension-less.
+        return mask_cpa_account(text)
+    stem = text[:dot]
+    ext = text[dot + 1:]
+    if not ext:
+        return mask_cpa_account(text)
+    if len(stem) > 4:
+        return f"{stem[:2]}***{stem[-1:]}.{ext}"
+    return f"{stem[:1]}***.{ext}"
+
+
+def auth_tag_from_locator(locator_hash: str) -> str:
+    """Derive a short human-eye tag from a locator hash.
+
+    Strips the ``hmac:v1:`` prefix and takes the last 6 hex chars, prefixed
+    with ``#``. Empty input -> ``""``. The tag is for visual row distinction
+    only and cannot be reversed to the original identity.
+    """
+    text = (locator_hash or "").strip()
+    if not text:
+        return ""
+    digest = text
+    prefix = "hmac:v1:"
+    if digest.startswith(prefix):
+        digest = digest[len(prefix):]
+    if not digest:
+        return ""
+    return "#" + digest[-6:]
+
+
+_CPA_PROVIDER_WHITELIST = {"codex", "claude"}
+
+
+def _normalize_provider(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in _CPA_PROVIDER_WHITELIST else "unknown"
 
 
 def map_cpa_plan(value: Any) -> str:
@@ -148,6 +207,8 @@ def _resolve_cpa_plan(entry: dict[str, Any]) -> str:
 
 
 def _account_from_auth_file(entry: dict[str, Any]) -> CPAAuthAccount | None:
+    from .cpa_queue import _header_values  # deferred: cpa_queue imports this module
+
     provider = _first_text(entry, ("provider", "type")).lower()
     if provider != "codex":
         return None
@@ -183,16 +244,41 @@ def _account_from_auth_file(entry: dict[str, Any]) -> CPAAuthAccount | None:
         subject = "identity_unavailable"
     identity_material = f"{auth_index.strip()}\x00{subject}"
 
+    quota = entry.get("quota")
+    quota_observed_at = ""
+    signals: dict[str, str] = {}
+    if isinstance(quota, dict):
+        observed_dt = _parse_timestamp(quota.get("observed_at"))
+        if observed_dt is not None:
+            quota_observed_at = observed_dt.isoformat().replace("+00:00", "Z")
+        signals = _header_values(quota.get("signals"))
+
+    plan = _resolve_cpa_plan(entry)
+    plan_type = signals.get("x-codex-plan-type")
+    if plan_type:
+        plan = map_cpa_plan(plan_type)
+
+    project_id = _first_text(entry, ("project_id", "projectId")) or _ordered_nested_text(
+        entry.get("id_token"), ("project_id", "projectId")
+    )
+    locator_hash = keyed_fingerprint("cpa-locator-v1", auth_index.strip())
+
     return CPAAuthAccount(
         auth_index=auth_index,
         auth_file_name=auth_file_name,
         account_key_hash=keyed_fingerprint("cpa-account-v2", identity_material),
         account_display=display,
-        plan=_resolve_cpa_plan(entry),
-        locator_hash=keyed_fingerprint("cpa-locator-v1", auth_index.strip()),
+        plan=plan,
+        locator_hash=locator_hash,
         subject_hash=keyed_fingerprint("cpa-canonical-subject-v1", subject),
         legacy_account_key_hash=hashlib.sha256(auth_index.encode("utf-8")).hexdigest(),
         previous_account_key_hash=keyed_fingerprint("cpa-account", auth_index),
+        quota_observed_at=quota_observed_at,
+        quota_signals=signals,
+        auth_file_masked=mask_auth_file_name(auth_file_name),
+        auth_tag=auth_tag_from_locator(locator_hash),
+        provider=_normalize_provider(provider),
+        project_id_masked=mask_cpa_account(project_id) if project_id else "",
     )
 
 

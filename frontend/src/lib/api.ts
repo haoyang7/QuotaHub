@@ -71,6 +71,8 @@ export interface QuotaWindow {
   blocked?: boolean;
   blocked_by?: string;
   effective_remaining?: number;
+  allowed?: boolean;
+  limit_reached?: boolean;
 }
 
 export interface OllamaModelUsage {
@@ -109,10 +111,15 @@ export interface CPAQuotaAccount {
   stale: boolean;
   updated_at: string;
   last_attempt_at?: string | null;
-  quota_source?: "usage_queue" | "quota_snapshots" | "header_snapshots" | "response_header" | "active_api";
-  observed_at?: string;
+  quota_source?: "usage_queue" | "quota_snapshots" | "header_snapshots" | "auth_files" | "response_header" | "active_api";
+  observed_at?: string | null;
   windows: QuotaWindow[];
   error?: string;
+  // Admin-only credential hints (omitted by the public DTO and absent from old caches).
+  auth_file_masked?: string;
+  auth_tag?: string;
+  provider?: "codex" | "claude" | "unknown";
+  project_id_masked?: string;
 }
 
 export type CPAQuotaSource = "none" | "native_queue" | "cpamp_snapshot";
@@ -126,7 +133,7 @@ export interface PublicCPAChannel {
   last_success_at?: string | null;
   quota_source: CPAQuotaSource;
   source_status: string;
-  snapshot_source?: "quota_snapshots" | "header_snapshots" | null;
+  snapshot_source?: "quota_snapshots" | "header_snapshots" | "auth_files" | null;
   last_source_snapshot_at?: string | null;
   error?: string;
   accounts: CPAQuotaAccount[];
@@ -373,6 +380,10 @@ export const api = {
     ),
   openCodeQuota: (id: string) =>
     request<AdminQuotaAccount>(`/api/admin/accounts/opencode/${id}/quota`),
+  refreshOpenCodeAccount: (id: string) =>
+    request<AdminQuotaAccount>(`/api/admin/accounts/opencode/${id}/refresh`, {
+      method: "POST",
+    }),
   listUsage: (id: string, params?: { offset?: number; limit?: number; key_id?: string }) => {
     const query = new URLSearchParams();
     if (params?.offset != null) query.set("offset", String(params.offset));
@@ -405,6 +416,10 @@ export const api = {
     }),
   deleteOllamaAccount: (id: string) =>
     request<{ ok: boolean }>(`/api/admin/accounts/ollama/${id}`, { method: "DELETE" }),
+  refreshOllamaAccount: (id: string) =>
+    request<OllamaQuotaAccount>(`/api/admin/accounts/ollama/${id}/refresh`, {
+      method: "POST",
+    }),
 
   listCPAChannels: () => request<AdminCPAChannel[]>("/api/admin/cpa/channels"),
   createCPAChannel: (body: Record<string, unknown>) =>
@@ -429,5 +444,9 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    }),
+  refreshCpaChannel: (channelId: string) =>
+    request<AdminCPAChannel>(`/api/admin/cpa/channels/${channelId}/refresh`, {
+      method: "POST",
     }),
 };

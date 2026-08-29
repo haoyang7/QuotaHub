@@ -451,6 +451,16 @@ async def test_popped_batch_is_written_after_lease_loss_but_no_next_request(
     assert len(cached) == 1
     assert cached[0]["quota_source"] == "usage_queue"
     assert cached[0]["plan"] == "Pro 5x"
+    with db.get_conn() as conn:
+        account_row = conn.execute(
+            """
+            SELECT plan, plan_observed_at FROM cpa_accounts
+            WHERE channel_id = ? AND canonical_account_hash = ?
+            """,
+            (channel.id, account.account_key_hash),
+        ).fetchone()
+    assert account_row["plan"] == "Pro 5x"
+    assert account_row["plan_observed_at"] == "2026-08-15T01:00:00Z"
     raw = db.db_path().read_bytes()
     for secret in (
         b"auth-1",

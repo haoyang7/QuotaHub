@@ -9,14 +9,18 @@ import pytest
 from app import db
 from app.cpa_quota import (
     CPAAuthAccount,
+    _normalize_provider,
+    auth_tag_from_locator,
     discover_cpa_accounts,
     map_cpa_plan,
+    mask_auth_file_name,
     mask_cpa_account,
     normalize_cpa_url,
     parse_auth_files,
     parse_cpa_usage_payload,
 )
 from app.quota import LABEL_ROLLING, LABEL_WEEKLY
+from app.secrets import keyed_fingerprint
 
 
 @pytest.mark.parametrize(
@@ -291,3 +295,128 @@ async def test_cpa_protocol_only_discovers_accounts(temp_data_dir):
 
     assert len(seen) == 1
     assert accounts[0].account_display == "p***@example.com"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("codex-a.json", "co***a.json"),
+        ("beta.json", "b***.json"),
+        ("ab.json", "a***.json"),
+        ("x.json", "x***.json"),
+        ("codex-account.json", "co***t.json"),
+        ("codex-beta", "co***ta"),
+        ("a-very-long-auth-file-name.json", "a-***e.json"),
+        ("", ""),
+        ("   ", ""),
+    ],
+)
+def test_mask_auth_file_name(name: str, expected: str):
+    assert mask_auth_file_name(name) == expected
+
+
+def test_mask_auth_file_name_no_extension_uses_account_mask():
+    # No dot at all -> mask_cpa_account rules on the whole string.
+    assert mask_auth_file_name("codex-beta") == mask_cpa_account("codex-beta")
+    # Leading-dot / trailing-dot edge cases also fall back to mask_cpa_account.
+    assert mask_auth_file_name(".json") == mask_cpa_account(".json")
+    assert mask_auth_file_name("codex.") == mask_cpa_account("codex.")
+
+
+@pytest.mark.parametrize(
+    ("locator_hash", "expected"),
+    [
+        ("hmac:v1:abc123def456", "#def456"),
+        ("hmac:v1:", ""),
+        ("", ""),
+        ("abcdef123456", "#123456"),
+    ],
+)
+def test_auth_tag_from_locator(locator_hash: str, expected: str):
+    assert auth_tag_from_locator(locator_hash) == expected
+
+
+def test_auth_tag_from_locator_real_hmac_digest(temp_data_dir):
+    # keyed_fingerprint returns "hmac:v1:" + a 64-char hex digest; the tag is
+    # the last 6 hex chars prefixed with "#".
+    digest = keyed_fingerprint("cpa-locator-v1", "auth-index-sensitive")
+    tag = auth_tag_from_locator(digest)
+    assert tag.startswith("#")
+    assert len(tag) == 7
+    # The raw auth_index must not leak into the tag.
+    assert "auth-index-sensitive" not in tag
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("codex", "codex"),
+        ("Claude", "claude"),
+        ("grok", "unknown"),
+        ("", "unknown"),
+        ("unknown", "unknown"),
+    ],
+)
+def test_normalize_provider_whitelist(raw: str, expected: str):
+    assert _normalize_provider(raw) == expected
+
+
+def test_parse_auth_files_fills_masked_credential_fields(temp_data_dir):
+    raw_name = "codex-account-sensitive.json"
+    raw_project_id = "proj-secret-1234567890"
+    account = parse_auth_files(
+        {
+            "files": [
+                {
+                    "provider": "codex",
+                    "auth_index": "auth-index-sensitive",
+                    "name": raw_name,
+                    "email": "alice@example.com",
+                    "project_id": raw_project_id,
+                    "account_type": "pro",
+                }
+            ]
+        }
+    )[0]
+    assert account.auth_file_masked == "co***e.json"
+    assert account.auth_tag.startswith("#")
+    assert len(account.auth_tag) == 7
+    assert account.provider == "codex"
+    assert account.project_id_masked == mask_cpa_account(raw_project_id)
+    # Raw identity values must not appear in the masked fields.
+    assert raw_name not in account.auth_file_masked
+    assert raw_project_id not in account.project_id_masked
+    assert "auth-index-sensitive" not in account.auth_tag
+
+
+def test_parse_auth_files_project_id_nested_in_id_token(temp_data_dir):
+    account = parse_auth_files(
+        {
+            "files": [
+                {
+                    "provider": "codex",
+                    "auth_index": "auth-1",
+                    "name": "codex-a.json",
+                    "email": "alice@example.com",
+                    "id_token": {"project_id": "nested-proj-1234567890"},
+                }
+            ]
+        }
+    )[0]
+    assert account.project_id_masked == mask_cpa_account("nested-proj-1234567890")
+
+
+def test_parse_auth_files_missing_project_id_leaves_mask_empty(temp_data_dir):
+    account = parse_auth_files(
+        {
+            "files": [
+                {
+                    "provider": "codex",
+                    "auth_index": "auth-1",
+                    "name": "codex-a.json",
+                    "email": "alice@example.com",
+                }
+            ]
+        }
+    )[0]
+    assert account.project_id_masked == ""
